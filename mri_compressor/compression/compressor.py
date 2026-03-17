@@ -1,0 +1,628 @@
+"""
+MRI-Compress Engine v2
+=======================
+Applies a CompressionPrescription to a HuggingFace LLM.
+
+New operations in v2 (informed by Studies 17-21):
+1. Dormant neuron removal -- removes neurons firing on <1% of inputs
+2. Attention head pruning -- zeros out lowest-impact heads per layer
+3. Depth pruning (applied) -- zeros out entire layers
+4. Low-rank factorization -- SVD decomposition of MLP weight matrices
+5. Weight sharing -- tie MLP weights between high-CKA layer pairs
+
+Architecture from v1 retained:
+- Sequential layer processing (collect -> compress -> reconstruct)
+- Dead neuron removal
+- Neuron merging
+- Wanda-guided structured pruning
+- Local reconstruction (SparseGPT-style)
+- RTN quantization (disabled)
+"""
+
+from __future__ import annotations
+import gc
+import logging
+import math
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.amp import autocast
+
+from .prescription import (
+    CompressionPrescription,
+    CompressionStrategy,
+    LayerPrescription,
+)
+from .operations import (
+    DeadNeuronRemover,
+    NeuronMerger,
+    WandaPruner,
+    AttentionHeadPruner,
+    DepthPruner,
+    LowRankFactorizer,
+    LocalReconstructor,
+    StaticNeuronFolder,
+    WeightSharer,
+)
+from ._utils import get_intermediate_size
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def timer(name: str):
+    t0 = time.perf_counter()
+    yield
+    logger.info(f"  {name}: {time.perf_counter() - t0:.1f}s")
+
+
+# ============================================================================
+# Data Collection (unchanged from v1)
+# ============================================================================
+
+@torch.no_grad()
+def collect_activations(model, dataloader, layer_idx, max_batches=16, device=torch.device("cuda")):
+    """Collect MLP intermediate activations for a single layer.
+
+    Collects per-batch on CPU to avoid OOM, then concatenates and moves the
+    final tensor back to GPU for fast downstream operations (dead removal,
+    merge, fold).
+    """
+    all_acts = []
+    mlp = model.model.layers[layer_idx].mlp
+    hook_data = {"acts": None}
+
+    def hook_fn(module, input, output):
+        hook_data["acts"] = input[0].detach()
+
+    handle = mlp.down_proj.register_forward_hook(hook_fn)
+    model.eval()
+    try:
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            ids = batch["input_ids"].to(device)
+            mask = batch.get("attention_mask", torch.ones_like(ids)).to(device)
+            with autocast("cuda", dtype=torch.bfloat16):
+                model(input_ids=ids, attention_mask=mask)
+            if hook_data["acts"] is not None:
+                acts = hook_data["acts"].reshape(-1, hook_data["acts"].shape[-1])
+                all_acts.append(acts.float().cpu())  # CPU to avoid OOM during collection
+                hook_data["acts"] = None
+    finally:
+        handle.remove()
+    if not all_acts:
+        raise RuntimeError(f"No activations collected for layer {layer_idx}")
+    # Concatenate on CPU, then move to GPU for fast operations
+    return torch.cat(all_acts, dim=0).to(device)
+
+
+@torch.no_grad()
+def collect_mlp_io(model, dataloader, layer_idx, max_batches=8, device=torch.device("cuda")):
+    inputs_list, outputs_list = [], []
+    mlp = model.model.layers[layer_idx].mlp
+    io = {"inp": None, "out": None}
+
+    def pre_hook(module, args, kwargs):
+        io["inp"] = args[0].detach().cpu()
+
+    def post_hook(module, args, kwargs, output):
+        out = output[0] if isinstance(output, tuple) else output
+        io["out"] = out.detach().cpu()
+
+    h1 = mlp.register_forward_pre_hook(pre_hook, with_kwargs=True)
+    h2 = mlp.register_forward_hook(post_hook, with_kwargs=True)
+    model.eval()
+    try:
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            ids = batch["input_ids"].to(device)
+            mask = batch.get("attention_mask", torch.ones_like(ids)).to(device)
+            with autocast("cuda", dtype=torch.bfloat16):
+                model(input_ids=ids, attention_mask=mask)
+            if io["inp"] is not None:
+                inputs_list.append(io["inp"])
+                outputs_list.append(io["out"])
+                io["inp"] = io["out"] = None
+    finally:
+        h1.remove()
+        h2.remove()
+    return inputs_list, outputs_list
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+@dataclass
+class CompressionResult:
+    original_ppl: float
+    compressed_ppl: float
+    per_layer_results: list[dict] = field(default_factory=list)
+    total_neurons_removed: int = 0
+    total_neurons_merged: int = 0
+    total_dormant_removed: int = 0
+    total_attn_heads_pruned: int = 0
+    total_depth_pruned_layers: int = 0
+    total_low_rank_layers: int = 0
+    total_folded_neurons: int = 0
+    total_weight_shared_pairs: int = 0
+    total_domain_unnecessary_removed: int = 0
+    total_params_original: int = 0
+    total_params_compressed: int = 0
+    elapsed_seconds: float = 0.0
+
+    def summary(self) -> str:
+        r = 1 - self.total_params_compressed / max(self.total_params_original, 1)
+        d = self.compressed_ppl - self.original_ppl
+        p = (self.compressed_ppl / max(self.original_ppl, 1e-8) - 1) * 100
+        lines = [
+            f"{'='*60}", "  MRI-Compress v2 Results", f"{'='*60}",
+            f"  Original PPL:       {self.original_ppl:.4f}",
+            f"  Compressed PPL:     {self.compressed_ppl:.4f}",
+            f"  PPL change:         {d:+.4f} ({p:+.2f}%)", "",
+            f"  Parameters:         {self.total_params_original:,} -> {self.total_params_compressed:,}",
+            f"  Reduction:          {r:.1%}",
+            f"  Dead neurons removed:   {self.total_neurons_removed:,}",
+            f"  Dormant neurons removed:{self.total_dormant_removed:,}",
+            f"  Neurons merged:         {self.total_neurons_merged:,}",
+            f"  Attn heads pruned:      {self.total_attn_heads_pruned}",
+            f"  Depth-pruned layers:    {self.total_depth_pruned_layers}",
+            f"  Low-rank factorized:    {self.total_low_rank_layers}",
+            f"  Folded neurons:         {self.total_folded_neurons:,}",
+            f"  Weight-shared pairs:    {self.total_weight_shared_pairs}",
+        ]
+        if self.total_domain_unnecessary_removed > 0:
+            lines.append(f"  Domain-unnecessary:     {self.total_domain_unnecessary_removed:,}")
+        lines.extend([
+            f"  Time:               {self.elapsed_seconds:.1f}s",
+            f"{'='*60}",
+        ])
+        return "\n".join(lines)
+
+
+class MRICompressor:
+    """
+    v2 compression pipeline with expanded strategy support.
+    """
+
+    def __init__(
+        self,
+        model, tokenizer,
+        prescription: CompressionPrescription,
+        calibration_dataloader,
+        device=torch.device("cuda"),
+        max_calibration_batches: int = 16,
+        do_reconstruction: bool = True,
+        reconstruction_lr: float = 1e-4,
+        reconstruction_iterations: int = 200,
+        enable_low_rank: bool = True,
+        enable_attn_pruning: bool = True,
+        enable_depth_pruning: bool = True,
+        enable_static_fold: bool = True,
+        enable_weight_sharing: bool = False,
+        domain_calibration_dataloader=None,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.prescription = prescription
+        self.dataloader = calibration_dataloader
+        self.domain_dataloader = domain_calibration_dataloader
+        self.device = device
+        self.max_cal_batches = max_calibration_batches
+        self.do_reconstruction = do_reconstruction
+        self.recon_lr = reconstruction_lr
+        self.recon_iters = reconstruction_iterations
+        self.enable_low_rank = enable_low_rank
+        self.enable_attn_pruning = enable_attn_pruning
+        self.enable_depth_pruning = enable_depth_pruning
+        self.enable_static_fold = enable_static_fold
+        self.enable_weight_sharing = enable_weight_sharing
+
+    def compress(self) -> CompressionResult:
+        t0 = time.perf_counter()
+        result = CompressionResult(
+            original_ppl=self.prescription.baseline_ppl,
+            compressed_ppl=0.0,
+            total_params_original=sum(p.numel() for p in self.model.parameters()),
+        )
+
+        print(self.prescription.summary())
+        logger.info("Starting MRI-Compress v2 pipeline...")
+
+        for lp in self.prescription.layers:
+            lr = self._process_layer(lp)
+            result.per_layer_results.append(lr)
+            result.total_neurons_removed += lr.get("dead_removed", 0)
+            result.total_dormant_removed += lr.get("dormant_removed", 0)
+            result.total_neurons_merged += lr.get("neurons_merged", 0)
+            result.total_attn_heads_pruned += lr.get("attn_heads_pruned", 0)
+            result.total_depth_pruned_layers += lr.get("depth_pruned", 0)
+            result.total_low_rank_layers += lr.get("low_rank_applied", 0)
+            result.total_folded_neurons += lr.get("neurons_folded", 0)
+            result.total_domain_unnecessary_removed += lr.get("domain_unnecessary_removed", 0)
+
+        # ---- Post-loop: Weight sharing between high-CKA layer pairs ----
+        if self.enable_weight_sharing and self.prescription.weight_sharing_pairs:
+            for layer_a, layer_b in self.prescription.weight_sharing_pairs:
+                try:
+                    ws_result = WeightSharer.share_mlp_weights(
+                        self.model, layer_a, layer_b, self.device)
+                    result.total_weight_shared_pairs += 1
+                    logger.info(
+                        f"  Weight sharing: layer {layer_a} -> {layer_b}, "
+                        f"params saved: {ws_result['params_saved']:,}")
+                except Exception as e:
+                    logger.warning(f"  Weight sharing failed for ({layer_a}, {layer_b}): {e}")
+
+        result.total_params_compressed = sum(p.numel() for p in self.model.parameters())
+        result.elapsed_seconds = time.perf_counter() - t0
+
+        logger.info("Evaluating compressed model...")
+        result.compressed_ppl = self._evaluate_ppl()
+
+        print(result.summary())
+        return result
+
+    def _get_reconstruction_dataloader(self, lp: LayerPrescription):
+        """Get the appropriate dataloader for reconstruction.
+
+        If a domain_calibration_dataloader is set and this layer has a
+        target_domain, use domain-specific data for "sharpening".
+        Otherwise fall back to the standard calibration dataloader.
+        """
+        if lp.target_domain and self.domain_dataloader is not None:
+            return self.domain_dataloader
+        return self.dataloader
+
+    def _process_layer(self, lp: LayerPrescription) -> dict:
+        lr = {
+            "layer": lp.layer_idx, "strategy": lp.strategy.name,
+            "dead_removed": 0, "dormant_removed": 0,
+            "neurons_merged": 0, "attn_heads_pruned": 0,
+            "depth_pruned": 0, "low_rank_applied": 0,
+            "neurons_folded": 0, "domain_unnecessary_removed": 0,
+            "reconstruction_mse": None,
+        }
+
+        logger.info(f"  Layer {lp.layer_idx}: {lp.strategy.name}")
+        layer = self.model.model.layers[lp.layer_idx]
+
+        # ---- Depth pruning (zero entire layer) ----
+        if lp.strategy == CompressionStrategy.DEPTH_PRUNE:
+            if self.enable_depth_pruning:
+                DepthPruner.prune_layer(layer)
+                lr["depth_pruned"] = 1
+                logger.info(f"    DEPTH PRUNED (zeroed all weights)")
+            else:
+                logger.info(f"    DEPTH PRUNE skipped (disabled)")
+            return lr
+
+        # ---- Light touch: static fold + low-rank + attention pruning ----
+        if lp.strategy == CompressionStrategy.LIGHT_TOUCH:
+            is_lossy_lt = False
+
+            # Static neuron folding (Study 20) -- applicable even on LIGHT_TOUCH
+            if (self.enable_static_fold and lp.foldable_neuron_count > 0
+                    and lp.foldable_neuron_indices is not None):
+                with timer(f"Collecting activations for layer {lp.layer_idx} (fold)"):
+                    activations = collect_activations(
+                        self.model, self.dataloader, lp.layer_idx,
+                        max_batches=min(4, self.max_cal_batches), device=self.device)
+                n_folded, activations = StaticNeuronFolder.fold(
+                    layer, activations, lp.foldable_neuron_indices, self.device)
+                lr["neurons_folded"] = n_folded
+                if n_folded > 0:
+                    logger.info(f"    Folded {n_folded} static neurons into bias")
+                    is_lossy_lt = True
+                del activations
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # Low-rank factorization (Study 18)
+            # Collect MLP I/O BEFORE factorization for reconstruction
+            mlp_io_lt = None
+            if lp.low_rank_target is not None and self.enable_low_rank:
+                if self.do_reconstruction:
+                    with timer(f"Collecting MLP I/O for layer {lp.layer_idx} (pre low-rank)"):
+                        mlp_io_lt = collect_mlp_io(
+                            self.model, self.dataloader, lp.layer_idx,
+                            max_batches=min(self.max_cal_batches, 8), device=self.device)
+
+                with timer(f"Low-rank factorization for layer {lp.layer_idx}"):
+                    ranks = LowRankFactorizer.factorize_mlp(
+                        layer, lp.low_rank_target, self.device)
+                if ranks:
+                    lr["low_rank_applied"] = 1
+                    is_lossy_lt = True
+
+                # Reconstruct to recover accuracy after SVD approximation
+                if self.do_reconstruction and is_lossy_lt and mlp_io_lt is not None:
+                    inputs, outputs = mlp_io_lt
+                    if inputs and outputs:
+                        iters = lp.reconstruction_iterations
+                        logger.info(f"    Reconstructing after low-rank ({iters} iters)...")
+                        mse = LocalReconstructor.reconstruct(
+                            layer, inputs, outputs,
+                            lr=self.recon_lr, iterations=iters, device=self.device)
+                        lr["reconstruction_mse"] = mse
+                        logger.info(f"    Final MSE: {mse:.6f}")
+                    del inputs, outputs
+                del mlp_io_lt
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # Attention head pruning
+            if lp.attn_heads_to_prune > 0 and self.enable_attn_pruning:
+                pruned = AttentionHeadPruner.prune_heads(
+                    layer, lp.attn_heads_to_prune,
+                    self.dataloader, self.model, lp.layer_idx, self.device,
+                    head_importance_data=lp.head_importance_data,
+                    cluster_prunable_heads=lp.cluster_prunable_heads)
+                lr["attn_heads_pruned"] = len(pruned)
+                logger.info(f"    Pruned {len(pruned)} attention heads: {pruned}")
+            return lr
+
+        # ---- Domain specialization: remove domain-unnecessary neurons ----
+        if lp.strategy == CompressionStrategy.DOMAIN_SPECIALIZE:
+            if lp.domain_unnecessary_indices:
+                # Use domain-specific dataloader for reconstruction "sharpening"
+                recon_dl = self._get_reconstruction_dataloader(lp)
+
+                # Collect MLP I/O BEFORE removal (for reconstruction)
+                mlp_io_domain = None
+                if self.do_reconstruction:
+                    with timer(f"Collecting MLP I/O for layer {lp.layer_idx} (domain recon)"):
+                        mlp_io_domain = collect_mlp_io(
+                            self.model, recon_dl, lp.layer_idx,
+                            max_batches=min(self.max_cal_batches, 8), device=self.device)
+
+                # Collect activations for removal
+                with timer(f"Collecting activations for layer {lp.layer_idx} (domain)"):
+                    activations = collect_activations(
+                        self.model, self.dataloader, lp.layer_idx,
+                        max_batches=min(4, self.max_cal_batches), device=self.device)
+
+                # Static neuron folding first (if applicable)
+                if (self.enable_static_fold and lp.foldable_neuron_count > 0
+                        and lp.foldable_neuron_indices is not None):
+                    n_folded, activations = StaticNeuronFolder.fold(
+                        layer, activations, lp.foldable_neuron_indices, self.device)
+                    lr["neurons_folded"] = n_folded
+                    if n_folded > 0:
+                        logger.info(f"    Folded {n_folded} static neurons into bias")
+
+                # Remove domain-unnecessary neurons by index
+                n_rm, activations = DeadNeuronRemover.remove_by_indices(
+                    layer, activations, lp.domain_unnecessary_indices,
+                    self.device, protected_indices=lp.protected_neuron_indices)
+                lr["domain_unnecessary_removed"] = n_rm
+                logger.info(f"    Removed {n_rm} domain-unnecessary neurons "
+                            f"(target domain: {lp.target_domain})")
+
+                # Merge if worthwhile
+                if (lp.merge_target_width is not None
+                        and lp.merge_target_width < activations.shape[1]):
+                    cur = activations.shape[1]
+                    tgt = min(lp.merge_target_width, cur)
+                    if tgt < cur:
+                        with timer(f"Merging neurons in layer {lp.layer_idx}"):
+                            nw, activations = NeuronMerger.merge(
+                                layer, activations, tgt, device=self.device)
+                            lr["neurons_merged"] = cur - nw
+                            logger.info(f"    Merged {cur} -> {nw} neurons")
+
+                # Reconstruct using domain-specific data ("sharpening")
+                if self.do_reconstruction and mlp_io_domain is not None:
+                    inputs, outputs = mlp_io_domain
+                    if inputs and outputs:
+                        iters = lp.reconstruction_iterations
+                        logger.info(f"    Domain reconstruction ({iters} iters, "
+                                    f"domain: {lp.target_domain})...")
+                        mse = LocalReconstructor.reconstruct(
+                            layer, inputs, outputs,
+                            lr=self.recon_lr, iterations=iters, device=self.device)
+                        lr["reconstruction_mse"] = mse
+                        logger.info(f"    Final MSE: {mse:.6f}")
+                    del inputs, outputs
+                del mlp_io_domain, activations
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # Attention head pruning
+            if lp.attn_heads_to_prune > 0 and self.enable_attn_pruning:
+                pruned = AttentionHeadPruner.prune_heads(
+                    layer, lp.attn_heads_to_prune,
+                    self.dataloader, self.model, lp.layer_idx, self.device,
+                    head_importance_data=lp.head_importance_data,
+                    cluster_prunable_heads=lp.cluster_prunable_heads)
+                lr["attn_heads_pruned"] = len(pruned)
+                logger.info(f"    Pruned {len(pruned)} attention heads: {pruned}")
+
+            # Low-rank factorization (post-domain-removal)
+            if lp.low_rank_target is not None and self.enable_low_rank:
+                with timer(f"Low-rank factorization for layer {lp.layer_idx}"):
+                    ranks = LowRankFactorizer.factorize_mlp(
+                        layer, lp.low_rank_target, self.device)
+                if ranks:
+                    lr["low_rank_applied"] = 1
+
+            return lr
+
+        # ---- Determine if lossy (needs reconstruction targets) ----
+        is_lossy = False
+        has_domain_overlay = (lp.domain_unnecessary_indices
+                              and len(lp.domain_unnecessary_indices) > 0)
+        if lp.strategy == CompressionStrategy.DEAD_REMOVAL_AND_MERGE:
+            has_merge = (lp.merge_target_width is not None and
+                         lp.merge_target_width < get_intermediate_size(layer) - lp.dead_neuron_count - lp.dormant_neuron_count)
+            is_lossy = has_merge or has_domain_overlay
+        elif lp.strategy in (CompressionStrategy.STRUCTURED_PRUNE, CompressionStrategy.DORMANT_REMOVAL):
+            is_lossy = True
+
+        # ---- Collect fresh MLP I/O before compression ----
+        # Use domain-specific dataloader for reconstruction when available
+        recon_dl = self._get_reconstruction_dataloader(lp)
+        mlp_io = None
+        if self.do_reconstruction and is_lossy:
+            with timer(f"Collecting MLP I/O for layer {lp.layer_idx}"):
+                mlp_io = collect_mlp_io(
+                    self.model, recon_dl, lp.layer_idx,
+                    max_batches=min(self.max_cal_batches, 8), device=self.device)
+
+        # ---- Collect activations ----
+        activations = None
+        needs_acts = lp.strategy in (
+            CompressionStrategy.DEAD_REMOVAL_AND_MERGE,
+            CompressionStrategy.DORMANT_REMOVAL,
+            CompressionStrategy.STRUCTURED_PRUNE,
+        )
+        if needs_acts:
+            n_batch = self.max_cal_batches
+            if lp.strategy == CompressionStrategy.DEAD_REMOVAL_AND_MERGE and not is_lossy:
+                n_batch = min(4, self.max_cal_batches)
+            with timer(f"Collecting activations for layer {lp.layer_idx}"):
+                activations = collect_activations(
+                    self.model, self.dataloader, lp.layer_idx,
+                    max_batches=n_batch, device=self.device)
+
+        # ---- MLP Compression ----
+        if lp.strategy == CompressionStrategy.DEAD_REMOVAL_AND_MERGE:
+            if activations is not None:
+                # Check if we need combined dead + domain-unnecessary removal
+                has_domain_removal = (lp.domain_unnecessary_indices
+                                      and len(lp.domain_unnecessary_indices) > 0)
+
+                if has_domain_removal and lp.dead_neuron_count > 0:
+                    # Combined single-pass removal to avoid index drift
+                    n_dead, n_domain, activations = DeadNeuronRemover.remove_combined(
+                        layer, activations,
+                        n_dead_to_remove=lp.dead_neuron_count,
+                        domain_unnecessary_indices=lp.domain_unnecessary_indices,
+                        device=self.device,
+                        protected_indices=lp.protected_neuron_indices)
+                    lr["dead_removed"] = n_dead
+                    lr["domain_unnecessary_removed"] = n_domain
+                    logger.info(f"    Combined removal: {n_dead} dead + "
+                                f"{n_domain} domain-unnecessary neurons")
+                else:
+                    # Standard dead-only removal
+                    if lp.dead_neuron_count > 0:
+                        n_rm, activations = DeadNeuronRemover.remove_by_mri_count(
+                            layer, activations, lp.dead_neuron_count, self.device,
+                            protected_indices=lp.protected_neuron_indices)
+                        lr["dead_removed"] = n_rm
+                        logger.info(f"    Removed {n_rm} dead neurons")
+
+                # Remove dormant neurons (NEW in v2)
+                if lp.dormant_neuron_count > 0:
+                    n_rm, activations = DeadNeuronRemover.remove_by_mri_count(
+                        layer, activations, lp.dormant_neuron_count, self.device,
+                        protected_indices=lp.protected_neuron_indices)
+                    lr["dormant_removed"] = n_rm
+                    logger.info(f"    Removed {n_rm} dormant neurons")
+
+                # Static neuron folding (Study 20) -- fold before merge
+                if (self.enable_static_fold and lp.foldable_neuron_count > 0
+                        and lp.foldable_neuron_indices is not None):
+                    n_folded, activations = StaticNeuronFolder.fold(
+                        layer, activations, lp.foldable_neuron_indices, self.device)
+                    lr["neurons_folded"] = n_folded
+                    logger.info(f"    Folded {n_folded} static neurons into bias")
+
+                # Merge
+                if lp.merge_target_width is not None:
+                    cur = activations.shape[1]
+                    tgt = min(lp.merge_target_width, cur)
+                    if tgt < cur:
+                        with timer(f"Merging neurons in layer {lp.layer_idx}"):
+                            nw, activations = NeuronMerger.merge(
+                                layer, activations, tgt, device=self.device)
+                            lr["neurons_merged"] = cur - nw
+                            logger.info(f"    Merged {cur} -> {nw} neurons")
+
+        elif lp.strategy == CompressionStrategy.DORMANT_REMOVAL:
+            if activations is not None:
+                total_to_remove = lp.dead_neuron_count + lp.dormant_neuron_count
+                if total_to_remove > 0:
+                    n_rm, activations = DeadNeuronRemover.remove_by_mri_count(
+                        layer, activations, total_to_remove, self.device,
+                        protected_indices=lp.protected_neuron_indices)
+                    lr["dead_removed"] = min(n_rm, lp.dead_neuron_count)
+                    lr["dormant_removed"] = max(0, n_rm - lp.dead_neuron_count)
+                    logger.info(f"    Removed {n_rm} neurons (dead+dormant)")
+
+                # Static neuron folding (Study 20)
+                if (self.enable_static_fold and lp.foldable_neuron_count > 0
+                        and lp.foldable_neuron_indices is not None):
+                    n_folded, activations = StaticNeuronFolder.fold(
+                        layer, activations, lp.foldable_neuron_indices, self.device)
+                    lr["neurons_folded"] = n_folded
+                    logger.info(f"    Folded {n_folded} static neurons into bias")
+
+        elif lp.strategy == CompressionStrategy.STRUCTURED_PRUNE:
+            if activations is not None:
+                n_pr, activations = WandaPruner.prune(
+                    layer, activations, lp.target_sparsity, self.device,
+                    precomputed_importance=lp.precomputed_wanda_scores)
+                lr["dead_removed"] = n_pr
+                logger.info(f"    Pruned {n_pr} neurons ({lp.target_sparsity:.0%})")
+
+        # ---- Attention head pruning (additive, on any strategy) ----
+        if lp.attn_heads_to_prune > 0 and self.enable_attn_pruning:
+            pruned = AttentionHeadPruner.prune_heads(
+                layer, lp.attn_heads_to_prune,
+                self.dataloader, self.model, lp.layer_idx, self.device,
+                head_importance_data=lp.head_importance_data,
+                cluster_prunable_heads=lp.cluster_prunable_heads)
+            lr["attn_heads_pruned"] = len(pruned)
+            logger.info(f"    Pruned {len(pruned)} attention heads: {pruned}")
+
+        # ---- Reconstruction ----
+        if self.do_reconstruction and is_lossy and mlp_io is not None:
+            inputs, outputs = mlp_io
+            if inputs and outputs:
+                iters = lp.reconstruction_iterations
+                if lp.cascade_amplification > 50:
+                    iters = int(iters * 1.5)
+                logger.info(f"    Reconstructing ({iters} iters)...")
+                mse = LocalReconstructor.reconstruct(
+                    layer, inputs, outputs,
+                    lr=self.recon_lr, iterations=iters, device=self.device)
+                lr["reconstruction_mse"] = mse
+                logger.info(f"    Final MSE: {mse:.6f}")
+
+        # ---- Low-rank factorization (post-pruning, post-reconstruction) ----
+        if lp.low_rank_target is not None and self.enable_low_rank:
+            with timer(f"Low-rank factorization for layer {lp.layer_idx}"):
+                ranks = LowRankFactorizer.factorize_mlp(
+                    layer, lp.low_rank_target, self.device)
+            if ranks:
+                lr["low_rank_applied"] = 1
+
+        del activations, mlp_io
+        gc.collect()
+        torch.cuda.empty_cache()
+        return lr
+
+    @torch.no_grad()
+    def _evaluate_ppl(self, max_batches: int = 8) -> float:
+        """Evaluate perplexity. Uses same logic as data_utils.evaluate_perplexity
+        for consistent numbers between Stage 3 and Stage 4."""
+        self.model.eval()
+        total_loss, total_tok = 0.0, 0
+        for i, batch in enumerate(self.dataloader):
+            if i >= max_batches:
+                break
+            ids = batch["input_ids"].to(self.device)
+            out = self.model(input_ids=ids, labels=ids)
+            seq_len = ids.shape[1] - 1  # shifted labels
+            total_loss += out.loss.item() * seq_len * ids.shape[0]
+            total_tok += seq_len * ids.shape[0]
+        return math.exp(total_loss / max(total_tok, 1))
