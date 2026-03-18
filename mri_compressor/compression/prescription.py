@@ -52,6 +52,7 @@ class LayerPrescription:
     precomputed_wanda_scores: Optional[Any] = None  # From Study 3 if available
     head_importance_data: Optional[list] = None  # From Study 6 if available
     pruning_approach: str = "structured"  # "structured", "uniform_or_quant", "gate_guided"
+    gate_importance_scores: Optional[list] = None  # From Study 2 gate patterns; used when pruning_approach=="gate_guided"
     static_mask_viable: bool = True  # From Study 8
     merge_worthwhile: bool = False  # From Study 8
 

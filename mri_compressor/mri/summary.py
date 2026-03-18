@@ -83,6 +83,24 @@ def build_summary(
             "max_kurtosis_layer": max(profiles, key=lambda p: p.kurtosis).layer_idx if profiles else -1,
         }
 
+    # ---- Study 2: Gate Patterns (canonical sparsity level) ----
+    # results["gate_training"] = Dict[float, Tuple[Dict[int, Tensor], metrics_dict]]
+    # We serialise gate scores at the sparsity level closest to 0.5 so the
+    # diagnostician can use them for gate-guided pruning (Study 7).
+    if "gate_training" in results:
+        gate_training = results["gate_training"]
+        sparsities = sorted(gate_training.keys())
+        canonical_sp = min(sparsities, key=lambda s: abs(s - 0.5))
+        patterns, _ = gate_training[canonical_sp]  # patterns: Dict[int, Tensor]
+        for layer_idx, gate_scores in patterns.items():
+            layer_key = str(layer_idx)
+            if layer_key not in summary["per_layer"]:
+                summary["per_layer"][layer_key] = {}
+            summary["per_layer"][layer_key]["study2_gate_patterns"] = {
+                "gate_scores": gate_scores.cpu().tolist(),  # list[float], len=intermediate_size
+                "sparsity_level": canonical_sp,
+            }
+
     # ---- Study 3: Wanda Scores ----
     if "wanda_scores" in results:
         wanda = results["wanda_scores"]  # dict: layer_idx -> tensor of scores

@@ -49,7 +49,7 @@ from .operations import (
     StaticNeuronFolder,
     WeightSharer,
 )
-from ._utils import get_intermediate_size
+from ._utils import get_intermediate_size, get_mlp_modules, get_mlp_submodule, resolve_layer
 
 logger = logging.getLogger(__name__)
 
@@ -66,29 +66,49 @@ def timer(name: str):
 # ============================================================================
 
 @torch.no_grad()
-def collect_activations(model, dataloader, layer_idx, max_batches=16, device=torch.device("cuda")):
+def collect_activations(
+    model, dataloader, layer_idx, max_batches=16,
+    device=torch.device("cuda"), inspector=None,
+):
     """Collect MLP intermediate activations for a single layer.
 
+    Architecture-agnostic: uses ``inspector.layer_path`` when provided,
+    otherwise falls back to common attribute paths.
+
     Collects per-batch on CPU to avoid OOM, then concatenates and moves the
-    final tensor back to GPU for fast downstream operations (dead removal,
-    merge, fold).
+    final tensor back to the target device for fast downstream operations.
     """
     all_acts = []
-    mlp = model.model.layers[layer_idx].mlp
+    layer = resolve_layer(model, layer_idx, inspector)
+    mlp_mods = get_mlp_modules(layer)
+    down_proj = mlp_mods.get("down_proj") or mlp_mods.get("fc2") or mlp_mods.get("c_proj")
+    if down_proj is None:
+        # last fallback: use the last Linear child of the mlp
+        for _, m in list(get_mlp_submodule(layer).named_modules())[::-1]:
+            if isinstance(m, nn.Linear):
+                down_proj = m
+                break
+    if down_proj is None:
+        raise RuntimeError(f"Cannot find down projection for layer {layer_idx}")
+
     hook_data = {"acts": None}
 
     def hook_fn(module, input, output):
         hook_data["acts"] = input[0].detach()
 
-    handle = mlp.down_proj.register_forward_hook(hook_fn)
+    handle = down_proj.register_forward_hook(hook_fn)
     model.eval()
+    use_cuda = str(device).startswith("cuda")
     try:
         for i, batch in enumerate(dataloader):
             if i >= max_batches:
                 break
             ids = batch["input_ids"].to(device)
             mask = batch.get("attention_mask", torch.ones_like(ids)).to(device)
-            with autocast("cuda", dtype=torch.bfloat16):
+            if use_cuda:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    model(input_ids=ids, attention_mask=mask)
+            else:
                 model(input_ids=ids, attention_mask=mask)
             if hook_data["acts"] is not None:
                 acts = hook_data["acts"].reshape(-1, hook_data["acts"].shape[-1])
@@ -98,14 +118,22 @@ def collect_activations(model, dataloader, layer_idx, max_batches=16, device=tor
         handle.remove()
     if not all_acts:
         raise RuntimeError(f"No activations collected for layer {layer_idx}")
-    # Concatenate on CPU, then move to GPU for fast operations
+    # Concatenate on CPU, then move to device for fast operations
     return torch.cat(all_acts, dim=0).to(device)
 
 
 @torch.no_grad()
-def collect_mlp_io(model, dataloader, layer_idx, max_batches=8, device=torch.device("cuda")):
+def collect_mlp_io(
+    model, dataloader, layer_idx, max_batches=8,
+    device=torch.device("cuda"), inspector=None,
+):
+    """Collect MLP input/output pairs for a single layer.
+
+    Architecture-agnostic: uses ``inspector.layer_path`` when provided.
+    """
     inputs_list, outputs_list = [], []
-    mlp = model.model.layers[layer_idx].mlp
+    layer = resolve_layer(model, layer_idx, inspector)
+    mlp = get_mlp_submodule(layer)
     io = {"inp": None, "out": None}
 
     def pre_hook(module, args, kwargs):
@@ -118,13 +146,17 @@ def collect_mlp_io(model, dataloader, layer_idx, max_batches=8, device=torch.dev
     h1 = mlp.register_forward_pre_hook(pre_hook, with_kwargs=True)
     h2 = mlp.register_forward_hook(post_hook, with_kwargs=True)
     model.eval()
+    use_cuda = str(device).startswith("cuda")
     try:
         for i, batch in enumerate(dataloader):
             if i >= max_batches:
                 break
             ids = batch["input_ids"].to(device)
             mask = batch.get("attention_mask", torch.ones_like(ids)).to(device)
-            with autocast("cuda", dtype=torch.bfloat16):
+            if use_cuda:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    model(input_ids=ids, attention_mask=mask)
+            else:
                 model(input_ids=ids, attention_mask=mask)
             if io["inp"] is not None:
                 inputs_list.append(io["inp"])
@@ -208,6 +240,7 @@ class MRICompressor:
         enable_static_fold: bool = True,
         enable_weight_sharing: bool = False,
         domain_calibration_dataloader=None,
+        inspector=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -224,6 +257,17 @@ class MRICompressor:
         self.enable_depth_pruning = enable_depth_pruning
         self.enable_static_fold = enable_static_fold
         self.enable_weight_sharing = enable_weight_sharing
+        self.inspector = inspector  # Optional ModelInspector for arch-agnostic layer resolution
+
+    def _get_layer(self, layer_idx: int) -> nn.Module:
+        """Resolve a transformer layer using the inspector (or common fallbacks)."""
+        return resolve_layer(self.model, layer_idx, self.inspector)
+
+    def _get_attn_info(self, layer_idx: int):
+        """Return the AttentionInfo for a layer if inspector is available."""
+        if self.inspector is not None and layer_idx < len(self.inspector.attn_layers):
+            return self.inspector.attn_layers[layer_idx]
+        return None
 
     def compress(self) -> CompressionResult:
         t0 = time.perf_counter()
@@ -253,7 +297,8 @@ class MRICompressor:
             for layer_a, layer_b in self.prescription.weight_sharing_pairs:
                 try:
                     ws_result = WeightSharer.share_mlp_weights(
-                        self.model, layer_a, layer_b, self.device)
+                        self.model, layer_a, layer_b, self.device,
+                        inspector=self.inspector)
                     result.total_weight_shared_pairs += 1
                     logger.info(
                         f"  Weight sharing: layer {layer_a} -> {layer_b}, "
@@ -292,7 +337,7 @@ class MRICompressor:
         }
 
         logger.info(f"  Layer {lp.layer_idx}: {lp.strategy.name}")
-        layer = self.model.model.layers[lp.layer_idx]
+        layer = self._get_layer(lp.layer_idx)
 
         # ---- Depth pruning (zero entire layer) ----
         if lp.strategy == CompressionStrategy.DEPTH_PRUNE:
@@ -314,7 +359,8 @@ class MRICompressor:
                 with timer(f"Collecting activations for layer {lp.layer_idx} (fold)"):
                     activations = collect_activations(
                         self.model, self.dataloader, lp.layer_idx,
-                        max_batches=min(4, self.max_cal_batches), device=self.device)
+                        max_batches=min(4, self.max_cal_batches), device=self.device,
+                        inspector=self.inspector)
                 n_folded, activations = StaticNeuronFolder.fold(
                     layer, activations, lp.foldable_neuron_indices, self.device)
                 lr["neurons_folded"] = n_folded
@@ -333,7 +379,8 @@ class MRICompressor:
                     with timer(f"Collecting MLP I/O for layer {lp.layer_idx} (pre low-rank)"):
                         mlp_io_lt = collect_mlp_io(
                             self.model, self.dataloader, lp.layer_idx,
-                            max_batches=min(self.max_cal_batches, 8), device=self.device)
+                            max_batches=min(self.max_cal_batches, 8), device=self.device,
+                            inspector=self.inspector)
 
                 with timer(f"Low-rank factorization for layer {lp.layer_idx}"):
                     ranks = LowRankFactorizer.factorize_mlp(
@@ -364,7 +411,8 @@ class MRICompressor:
                     layer, lp.attn_heads_to_prune,
                     self.dataloader, self.model, lp.layer_idx, self.device,
                     head_importance_data=lp.head_importance_data,
-                    cluster_prunable_heads=lp.cluster_prunable_heads)
+                    cluster_prunable_heads=lp.cluster_prunable_heads,
+                    attn_info=self._get_attn_info(lp.layer_idx))
                 lr["attn_heads_pruned"] = len(pruned)
                 logger.info(f"    Pruned {len(pruned)} attention heads: {pruned}")
             return lr
@@ -381,13 +429,15 @@ class MRICompressor:
                     with timer(f"Collecting MLP I/O for layer {lp.layer_idx} (domain recon)"):
                         mlp_io_domain = collect_mlp_io(
                             self.model, recon_dl, lp.layer_idx,
-                            max_batches=min(self.max_cal_batches, 8), device=self.device)
+                            max_batches=min(self.max_cal_batches, 8), device=self.device,
+                            inspector=self.inspector)
 
                 # Collect activations for removal
                 with timer(f"Collecting activations for layer {lp.layer_idx} (domain)"):
                     activations = collect_activations(
                         self.model, self.dataloader, lp.layer_idx,
-                        max_batches=min(4, self.max_cal_batches), device=self.device)
+                        max_batches=min(4, self.max_cal_batches), device=self.device,
+                        inspector=self.inspector)
 
                 # Static neuron folding first (if applicable)
                 if (self.enable_static_fold and lp.foldable_neuron_count > 0
@@ -441,7 +491,8 @@ class MRICompressor:
                     layer, lp.attn_heads_to_prune,
                     self.dataloader, self.model, lp.layer_idx, self.device,
                     head_importance_data=lp.head_importance_data,
-                    cluster_prunable_heads=lp.cluster_prunable_heads)
+                    cluster_prunable_heads=lp.cluster_prunable_heads,
+                    attn_info=self._get_attn_info(lp.layer_idx))
                 lr["attn_heads_pruned"] = len(pruned)
                 logger.info(f"    Pruned {len(pruned)} attention heads: {pruned}")
 
@@ -474,7 +525,8 @@ class MRICompressor:
             with timer(f"Collecting MLP I/O for layer {lp.layer_idx}"):
                 mlp_io = collect_mlp_io(
                     self.model, recon_dl, lp.layer_idx,
-                    max_batches=min(self.max_cal_batches, 8), device=self.device)
+                    max_batches=min(self.max_cal_batches, 8), device=self.device,
+                    inspector=self.inspector)
 
         # ---- Collect activations ----
         activations = None
@@ -490,7 +542,8 @@ class MRICompressor:
             with timer(f"Collecting activations for layer {lp.layer_idx}"):
                 activations = collect_activations(
                     self.model, self.dataloader, lp.layer_idx,
-                    max_batches=n_batch, device=self.device)
+                    max_batches=n_batch, device=self.device,
+                    inspector=self.inspector)
 
         # ---- MLP Compression ----
         if lp.strategy == CompressionStrategy.DEAD_REMOVAL_AND_MERGE:
@@ -568,9 +621,18 @@ class MRICompressor:
 
         elif lp.strategy == CompressionStrategy.STRUCTURED_PRUNE:
             if activations is not None:
+                # Choose importance source: gate-guided (Study 2) or Wanda (Study 3)
+                importance = lp.precomputed_wanda_scores
+                if (lp.pruning_approach == "gate_guided"
+                        and lp.gate_importance_scores is not None):
+                    logger.info(
+                        f"    Using gate-guided importance scores for layer {lp.layer_idx}")
+                    importance = torch.tensor(
+                        lp.gate_importance_scores, dtype=torch.float32,
+                        device=self.device)
                 n_pr, activations = WandaPruner.prune(
                     layer, activations, lp.target_sparsity, self.device,
-                    precomputed_importance=lp.precomputed_wanda_scores)
+                    precomputed_importance=importance)
                 lr["dead_removed"] = n_pr
                 logger.info(f"    Pruned {n_pr} neurons ({lp.target_sparsity:.0%})")
 

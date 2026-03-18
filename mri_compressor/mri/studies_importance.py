@@ -90,6 +90,7 @@ def run_critical_neuron_search(
     max_eval_batches: int = 8,
     top_k_per_layer: int = 5,       # test top-k candidates per layer
     candidate_method: str = "weight_norm",  # how to select candidates
+    prior_results: Optional[dict] = None,
 ) -> List[CriticalNeuronReport]:
     """
     Study 9: Find the most critical neurons in the model.
@@ -101,15 +102,32 @@ def run_critical_neuron_search(
     can catastrophically impair a 72B-parameter model."
 
     Method:
-    1. Rank neurons by a fast heuristic (weight norm, activation magnitude)
-    2. Test top candidates by zeroing them out one at a time
-    3. Measure perplexity impact
+    1. Rank neurons by Wanda importance (Study 3) when available, otherwise
+       fall back to weight norm / activation magnitude heuristics.
+    2. Test top candidates by zeroing them out one at a time.
+    3. Measure perplexity impact.
 
-    This reveals the vulnerability structure of the model.
+    Using Wanda scores concentrates the fixed budget on neurons that are
+    genuinely important (high weight × activation), finding critical neurons
+    faster than uniform weight-norm sampling.
+
+    Args:
+        prior_results: Optional dict of previously run study results.
+            If ``results["wanda_scores"]`` (Study 3) is present, Wanda
+            importance ranks are used for candidate selection regardless
+            of ``candidate_method``.
     """
     print("\n" + "="*80)
     print("STUDY 9: Critical Neuron Search")
     print("="*80)
+
+    # Pull pre-computed Wanda scores from Study 3 if available
+    wanda_scores: Optional[Dict[int, torch.Tensor]] = None
+    if prior_results is not None:
+        ws = prior_results.get("wanda_scores")
+        if ws is not None and isinstance(ws, dict):
+            wanda_scores = ws
+            print("  Reusing Study 3 Wanda scores for candidate selection.")
 
     # First, get baseline perplexity
     eval_loader = get_dataloader(dataset, batch_size=batch_size)
@@ -126,8 +144,12 @@ def run_critical_neuron_search(
         # Detect layout: nn.Linear is (hidden, intermediate), Conv1D is (intermediate, hidden)
         is_conv1d = (down_w.shape[0] == mlp.intermediate_size)
 
-        # Select candidates based on heuristic
-        if candidate_method == "weight_norm":
+        # Prefer Wanda scores (Study 3) for candidate selection — they capture both
+        # weight magnitude AND activation statistics, so they are the best proxy for
+        # criticality within the Study 9 budget.
+        if wanda_scores is not None and layer_idx in wanda_scores:
+            neuron_importance = wanda_scores[layer_idx].float().cpu()
+        elif candidate_method == "weight_norm":
             if is_conv1d:
                 neuron_importance = down_w.norm(dim=1)  # norm per row
             else:

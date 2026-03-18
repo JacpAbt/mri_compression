@@ -63,10 +63,17 @@ def run_cross_layer_motif_analysis(
     top_k_neurons: int = 200,
     fire_threshold: float = 0.01,
     lift_threshold: float = 1.5,
+    prior_results: Optional[dict] = None,
 ) -> List[CrossLayerMotifReport]:
     """
     Study 12: Analyze feed-forward relay structure between adjacent layers.
     Uses LIFT metric instead of raw conditional probability.
+
+    Args:
+        prior_results: Optional dict of previously run study results.
+            If ``results["dead_neurons"]`` (Study 5) is present, its per-layer
+            firing rate data is reused to skip an extra ``collect_single_layer``
+            call per layer.
     """
     print("\n" + "="*80)
     print("STUDY 12: Feed-Forward Loop Motif Analysis")
@@ -74,24 +81,41 @@ def run_cross_layer_motif_analysis(
           f"fire_threshold={fire_threshold})")
     print("="*80)
 
+    # Try to pull pre-computed firing rates from Study 5
+    study5_firing_rates: Optional[dict] = None
+    if prior_results is not None:
+        dn = prior_results.get("dead_neurons")
+        if dn is not None and isinstance(dn, dict) and "layer_firing_rates" in dn:
+            study5_firing_rates = dn["layer_firing_rates"]
+            print("  Reusing Study 5 layer firing rates.")
+
     reports = []
     prev_firing = None
     prev_layer_idx = None
 
     for layer_idx in range(inspector.num_layers):
-        act = collect_single_layer(inspector, dataset, layer_idx,
-                                   batch_size=batch_size, max_batches=max_batches)
-        firing = (act.abs() > fire_threshold).float()
-        D = firing.shape[1]
+        # Reuse Study 5 firing rates if available for this layer
+        if study5_firing_rates is not None and layer_idx in study5_firing_rates:
+            firing = study5_firing_rates[layer_idx].float()
+            D = firing.shape[1] if firing.dim() == 2 else firing.shape[0]
+        else:
+            act = collect_single_layer(inspector, dataset, layer_idx,
+                                       batch_size=batch_size, max_batches=max_batches)
+            firing = (act.abs() > fire_threshold).float()
+            D = firing.shape[1]
+            del act
 
         if prev_firing is not None:
-            # Sample most selectively-firing neurons (rate closest to 0.5)
+            # Sample most selectively-firing neurons (rate closest to 0.5).
+            # Scale sample size proportionally for small models so we get a
+            # meaningful fraction of neurons rather than a fixed 200.
             prev_rates = prev_firing.mean(dim=0)
             curr_rates = firing.mean(dim=0)
             prev_variability = (prev_rates - 0.5).abs()
             curr_variability = (curr_rates - 0.5).abs()
 
-            k = min(top_k_neurons, D)
+            # Dynamic sample size: at least top_k_neurons, scaled by D//8 for large layers
+            k = min(D, max(top_k_neurons, D // 8))
             prev_idx = prev_variability.topk(k, largest=False).indices
             curr_idx = curr_variability.topk(k, largest=False).indices
 
@@ -156,7 +180,6 @@ def run_cross_layer_motif_analysis(
         del prev_firing
         prev_firing = firing
         prev_layer_idx = layer_idx
-        del act
         gc.collect()
 
     del prev_firing
@@ -302,9 +325,12 @@ def run_information_bottleneck_profile(
         for h in skip_hooks:
             h.remove()
 
-        # Information retained: how much of the output info is available at layer L
+        # Information retained: how much of the output info is available at layer L.
+        # Clamp to [0, 1]: partial_ppl < baseline_ppl can happen due to noise but
+        # info_retained > 1.0 is nonsensical and breaks downstream usage.
         if baseline_ppl > 0 and partial_ppl < float('inf'):
-            info_retained = max(0.0, 1.0 - (partial_ppl - baseline_ppl) / (baseline_ppl + 1e-10))
+            info_retained = max(0.0, min(1.0,
+                1.0 - (partial_ppl - baseline_ppl) / (baseline_ppl + 1e-10)))
         else:
             info_retained = 0.0
 

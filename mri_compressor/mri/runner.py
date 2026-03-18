@@ -152,6 +152,7 @@ class MRIRunner:
                 self.inspector, self.dataset,
                 batch_size=self.config.batch_size,
                 max_eval_batches=self.config.max_eval_batches,
+                prior_results=self.results,
             )
 
         elif study_num == 10:
@@ -176,6 +177,7 @@ class MRIRunner:
                 self.inspector, self.dataset,
                 batch_size=self.config.batch_size,
                 max_batches=self.config.max_batches,
+                prior_results=self.results,
             )
 
         elif study_num == 13:
@@ -192,6 +194,7 @@ class MRIRunner:
                 self.inspector, self.dataset,
                 batch_size=self.config.batch_size,
                 max_batches=self.config.max_batches,
+                prior_results=self.results,
             )
 
         elif study_num == 15:
@@ -200,6 +203,7 @@ class MRIRunner:
                 self.inspector, self.dataset,
                 batch_size=self.config.batch_size,
                 max_eval_batches=self.config.max_eval_batches,
+                prior_results=self.results,
             )
 
         elif study_num == 16:
@@ -208,6 +212,7 @@ class MRIRunner:
                 self.inspector, self.dataset,
                 batch_size=self.config.batch_size,
                 max_batches=self.config.max_batches,
+                prior_results=self.results,
             )
 
         elif study_num == 17:
@@ -258,6 +263,7 @@ class MRIRunner:
                 batch_size=self.config.batch_size,
                 max_batches=self.config.max_batches,
                 custom_domain_datasets=custom,
+                prior_results=self.results,
             )
 
         else:

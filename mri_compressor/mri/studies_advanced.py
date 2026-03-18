@@ -48,16 +48,31 @@ def run_functional_redundancy_census(
     batch_size: int = 4,
     max_batches: int = 16,
     sample_neurons: int = 1024,
+    prior_results: Optional[dict] = None,
+    alpha: float = 0.6,
 ) -> List[FunctionalRedundancyReport]:
     """
     Study 14: Measure neuron-level functional redundancy per layer.
 
     For each layer, each neuron's "activation profile" is its vector of activations
-    across all tokens. The max cosine similarity to any other neuron in the same
-    layer measures how replaceable that neuron is.
+    across all tokens.  We combine **activation-profile** cosine similarity with
+    **weight-output** cosine similarity to get a richer redundancy score:
+
+        combined_sim = alpha * act_sim + (1 - alpha) * weight_sim
+
+    where ``weight_sim[i, j] = cos(W_out[:, i], W_out[:, j])`` measures whether
+    neurons write similar things into the residual stream, not just whether they
+    fire together.  Two neurons can fire identically (act_sim ≈ 1) while writing
+    very different things (weight_sim ≈ 0) — only the combined score treats them
+    as truly redundant.
+
+    Args:
+        prior_results: Optional dict of prior study results (reserved for future
+            data reuse; currently unused as Study 1 stores statistics only).
+        alpha: Weight given to activation similarity (default 0.6).
     """
     print("\n" + "="*80)
-    print("STUDY 14: Functional Redundancy Census")
+    print("STUDY 14: Functional Redundancy Census (activation + weight similarity)")
     print("="*80)
 
     reports = []
@@ -81,21 +96,43 @@ def run_functional_redundancy_census(
 
         k = act_sampled.shape[1]
 
-        # Cosine similarity matrix (k x k)
+        # --- Activation-profile cosine similarity (k × k) ---
         norms = act_sampled.norm(dim=0, keepdim=True).clamp(min=1e-10)
         act_normed = act_sampled / norms
-        sim_matrix = act_normed.T @ act_normed
-        sim_matrix.fill_diagonal_(0.0)
+        act_sim = act_normed.T @ act_normed          # (k, k)
+        act_sim.fill_diagonal_(0.0)
 
-        max_sim, _ = sim_matrix.max(dim=1)
+        # --- Weight-output cosine similarity ---
+        # W_out[:, j] is the residual-stream vector written by neuron j (down_proj column).
+        # Two neurons may fire together yet write different things — weight_sim catches this.
+        mlp_info = inspector.mlp_layers[layer_idx]
+        W_out = mlp_info.down_proj.weight.data.float().cpu()
+        if W_out.shape[0] < W_out.shape[1]:
+            # Conv1D layout: (intermediate, hidden) — rows are per-neuron output vectors
+            W_out_sampled = W_out[neuron_idx]                       # (k, hidden)
+            W_out_normed = F.normalize(W_out_sampled, dim=1)
+            weight_sim = W_out_normed @ W_out_normed.T              # (k, k)
+        else:
+            # Standard layout: (hidden, intermediate) — columns are per-neuron output vectors
+            W_out_sampled = W_out[:, neuron_idx]                    # (hidden, k)
+            W_out_normed = F.normalize(W_out_sampled, dim=0)
+            weight_sim = W_out_normed.T @ W_out_normed              # (k, k)
+        weight_sim.fill_diagonal_(0.0)
+        weight_sim = weight_sim.to(act_sim.device)
+
+        # --- Combined redundancy score ---
+        combined = alpha * act_sim + (1.0 - alpha) * weight_sim    # (k, k)
+        combined.fill_diagonal_(0.0)
+
+        max_sim, _ = combined.max(dim=1)
 
         mean_max_sim = max_sim.mean().item()
         median_max_sim = max_sim.median().item()
         n_highly_redundant = (max_sim > 0.9).sum().item()
         n_keystone = (max_sim < 0.3).sum().item()
 
-        # Redundancy groups: neurons with degree >= 2 in the sim>0.8 graph
-        high_sim = (sim_matrix > 0.8).float()
+        # Redundancy groups: neurons with degree >= 2 in the combined_sim > 0.8 graph
+        high_sim = (combined > 0.8).float()
         degree = high_sim.sum(dim=1)
         n_in_groups = (degree >= 2).sum().item()
 
@@ -122,7 +159,7 @@ def run_functional_redundancy_census(
               f"keystone(<0.3)={int(n_keystone * scale):4d}, "
               f"safe_to_prune={int(safe_count * scale):4d}/{D}")
 
-        del act, act_sampled, sim_matrix, act_normed, max_sim
+        del act, act_sampled, act_sim, weight_sim, combined, max_sim
         gc.collect()
 
     return reports
@@ -158,14 +195,30 @@ def run_perturbation_cascade_analysis(
     max_eval_batches: int = 4,
     neurons_per_layer: int = 3,
     sample_layers: int = 8,
+    prior_results: Optional[dict] = None,
 ) -> List[PerturbationCascadeReport]:
     """
     Study 15: Track how single-neuron perturbations propagate downstream.
     Uses normalized perturbation and local damping ratios.
+
+    Args:
+        prior_results: Optional dict of prior study results.  If
+            ``results["wanda_scores"]`` (Study 3) is available, neurons are
+            selected by their Wanda importance ranking rather than weight norm.
+            This focuses the perturbation budget on the most critical neurons
+            (highest-importance first) so the cascade amplitudes reflect
+            worst-case propagation.
     """
     print("\n" + "="*80)
     print("STUDY 15: Perturbation Cascade Depth")
     print("="*80)
+
+    # Try to pull pre-computed Wanda scores from Study 3
+    wanda_scores: Optional[dict] = None
+    if prior_results is not None:
+        wanda_scores = prior_results.get("wanda_scores")
+        if wanda_scores is not None:
+            print("  Using Study 3 Wanda scores for importance-weighted neuron sampling.")
 
     eval_loader = get_dataloader(dataset, batch_size=batch_size)
     layers_module = inspector.get_layers()
@@ -185,12 +238,14 @@ def run_perturbation_cascade_analysis(
     reports = []
 
     for source_layer in test_layers:
-        # Pick top neurons by weight norm
         mlp = inspector.mlp_layers[source_layer]
         down_w = mlp.down_proj.weight.data.cpu().float()
         D = mlp.intermediate_size
 
-        if down_w.shape[0] == D:
+        # Prefer Wanda scores (Study 3) for importance ranking over weight norm
+        if wanda_scores is not None and source_layer in wanda_scores:
+            neuron_importance = wanda_scores[source_layer].cpu().float()
+        elif down_w.shape[0] == D:
             neuron_importance = down_w.norm(dim=1)
         else:
             neuron_importance = down_w.norm(dim=0)
@@ -346,6 +401,7 @@ class PhaseTransitionReport:
     gaussian_fit_ks: float          # KS statistic vs Gaussian (higher = less Gaussian)
     log_log_slope: float            # slope of log-log survival function
     activation_entropy: float       # Shannon entropy of discretized distribution
+    is_gated: bool = False          # True for SwiGLU / GEGLU layers
 
 
 def fit_power_law_tail(magnitudes: torch.Tensor, x_min_percentile: float = 90.0) -> Tuple[float, float]:
@@ -376,11 +432,29 @@ def run_phase_transition_analysis(
     dataset: TextDataset,
     batch_size: int = 4,
     max_batches: int = 16,
+    prior_results: Optional[dict] = None,
 ) -> List[PhaseTransitionReport]:
-    """Study 16: Fit power-law exponents to activation magnitude distributions."""
+    """
+    Study 16: Fit power-law exponents to activation magnitude distributions.
+
+    For gated MLPs (SwiGLU), the raw activation distribution is bimodal: a large
+    mass near zero (gate suppressed) and a heavier tail (gate open).  Fitting a
+    power law to the full distribution blends both populations, producing a
+    meaningless exponent and a spuriously high ``tail_fraction``.
+
+    Fix: we fit only the **active population** — values above ``median * 0.5``.
+    This separates gate-open neurons from gate-suppressed ones.  For standard
+    GELU/ReLU MLPs the filter is effectively a no-op (no bimodal structure).
+
+    Args:
+        prior_results: Optional dict of prior study results (reserved; Study 1
+            stores statistics, not raw activation tensors).
+    """
     print("\n" + "="*80)
     print("STUDY 16: Activation Magnitude Phase Transition")
     print("="*80)
+
+    is_gated_model = inspector.is_gated  # True for Llama/Qwen SwiGLU
 
     reports = []
     for layer_idx in range(inspector.num_layers):
@@ -389,32 +463,41 @@ def run_phase_transition_analysis(
 
         magnitudes = act.abs().flatten()
 
-        # --- Power-law fit ---
-        alpha, x_min = fit_power_law_tail(magnitudes, x_min_percentile=90.0)
-
-        # --- Tail fraction ---
+        # --- Filter to active population (avoids bimodal contamination for gated MLPs) ---
         median_val = magnitudes.median().item()
-        tail_fraction = (magnitudes > 10 * max(median_val, 1e-10)).float().mean().item()
+        active_magnitudes = magnitudes[magnitudes > median_val * 0.5]
+        if len(active_magnitudes) < 100:
+            active_magnitudes = magnitudes  # fallback: not enough data to filter
 
-        # --- Gaussian fit quality (KS statistic) ---
-        mu = magnitudes.mean().item()
-        sigma = magnitudes.std().item()
+        # --- Power-law fit on active population ---
+        alpha, x_min = fit_power_law_tail(active_magnitudes, x_min_percentile=90.0)
 
-        n_test = min(10000, len(magnitudes))
-        sample = magnitudes[torch.randperm(len(magnitudes))[:n_test]].sort().values
+        # --- Tail fraction (relative to active population) ---
+        # For gated models, compute tail fraction only over the active population
+        # so we don't inflate the fraction by counting gate-suppressed near-zeros.
+        ref_magnitudes = active_magnitudes if is_gated_model else magnitudes
+        ref_median = ref_magnitudes.median().item()
+        tail_fraction = (ref_magnitudes > 10 * max(ref_median, 1e-10)).float().mean().item()
+
+        # --- Gaussian fit quality (KS statistic) on active population ---
+        mu = active_magnitudes.mean().item()
+        sigma = active_magnitudes.std().item()
+
+        n_test = min(10000, len(active_magnitudes))
+        sample = active_magnitudes[torch.randperm(len(active_magnitudes))[:n_test]].sort().values
         theoretical_cdf = 0.5 * (1 + torch.erf(
             (sample - mu) / (sigma * np.sqrt(2) + 1e-10)))
         empirical_cdf = torch.linspace(0, 1, n_test)
         ks_stat = (theoretical_cdf - empirical_cdf).abs().max().item()
 
         # --- Log-log slope of survival function ---
-        sorted_mags, _ = magnitudes.sort(descending=True)
+        sorted_mags, _ = active_magnitudes.sort(descending=True)
         mag_min = max(sorted_mags[-1].item(), 1e-10)
         mag_max = max(sorted_mags[0].item(), 1e-10)
 
         if mag_max > mag_min:
             points = torch.logspace(np.log10(mag_min), np.log10(mag_max), 100)
-            survival = [(magnitudes > p).float().mean().item() for p in points]
+            survival = [(active_magnitudes > p).float().mean().item() for p in points]
             valid = [(np.log10(p.item()), np.log10(s + 1e-10))
                      for p, s in zip(points, survival) if s > 0]
             if len(valid) > 2:
@@ -442,14 +525,16 @@ def run_phase_transition_analysis(
             gaussian_fit_ks=ks_stat,
             log_log_slope=slope,
             activation_entropy=entropy,
+            is_gated=is_gated_model,
         )
         reports.append(report)
 
+        gated_marker = " [gated]" if is_gated_model else ""
         tail_marker = " ← HEAVY TAIL" if is_heavy else ""
         print(f"  Layer {layer_idx:2d}: alpha={alpha:.2f}, tail_frac={tail_fraction:.4f}, "
-              f"KS={ks_stat:.3f}, entropy={entropy:.2f}{tail_marker}")
+              f"KS={ks_stat:.3f}, entropy={entropy:.2f}{gated_marker}{tail_marker}")
 
-        del act, magnitudes
+        del act, magnitudes, active_magnitudes
         gc.collect()
 
     # Summary

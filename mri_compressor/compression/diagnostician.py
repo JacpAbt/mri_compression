@@ -492,11 +492,23 @@ class MRIDiagnostician:
             else:
                 pruning_approach = "structured"
 
-            # Study 7: pearson correlation
+            # Study 7: pearson correlation → gate-guided pruning when low correlation
             s7 = ld.get("study7_gate_wanda_correlation", {})
             pearson = s7.get("pearson_r", 1.0)
             if pearson < 0.5:
                 pruning_approach = "gate_guided"
+
+            # Study 2: gate importance scores for gate_guided pruning
+            gate_importance_scores = None
+            if pruning_approach == "gate_guided":
+                s2 = ld.get("study2_gate_patterns", {})
+                if s2:
+                    gate_importance_scores = s2.get("gate_scores", None)
+                else:
+                    logger.warning(
+                        "Layer %d: gate_guided pruning requested but no study2_gate_patterns "
+                        "found in summary — falling back to Wanda.", layer_idx
+                    )
 
             # Study 8: co-activation and consistency
             s8 = ld.get("study8_sparsity_structure", {})
@@ -613,6 +625,7 @@ class MRIDiagnostician:
                 precomputed_wanda_scores=precomputed_wanda_scores,
                 head_importance_data=head_importance_data,
                 pruning_approach=pruning_approach,
+                gate_importance_scores=gate_importance_scores,
                 static_mask_viable=static_mask_viable,
                 merge_worthwhile=merge_worthwhile,
                 # Studies 12-21 integrations

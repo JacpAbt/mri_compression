@@ -204,7 +204,8 @@ class DomainDivergenceReport:
     layer_idx: int
     domain_a: str
     domain_b: str
-    jaccard_similarity: float
+    jaccard_similarity: float            # binary (firing rate > threshold)
+    magnitude_weighted_jaccard: float    # sum(min(r_A, r_B)) / sum(max(r_A, r_B))
     cosine_similarity: float
     n_shared_active: int
     n_domain_a_specific: int
@@ -250,6 +251,12 @@ def compute_domain_divergence(
                 jaccard = intersection / (union + 1e-10)
 
                 ra, rb = rates[da].float(), rates[db].float()
+
+                # Magnitude-weighted Jaccard: sum(min(r_A, r_B)) / sum(max(r_A, r_B))
+                # Preserves gradient information; tighter measure than binary Jaccard.
+                mw_jaccard = (torch.min(ra, rb).sum() / (
+                    torch.max(ra, rb).sum() + 1e-10)).item()
+
                 cosine = (ra @ rb) / (ra.norm() * rb.norm() + 1e-10)
 
                 ra_c = ra - ra.mean()
@@ -263,21 +270,31 @@ def compute_domain_divergence(
 
                 pairwise_reports.append(DomainDivergenceReport(
                     layer_idx=layer_idx, domain_a=da, domain_b=db,
-                    jaccard_similarity=jaccard, cosine_similarity=cosine.item(),
+                    jaccard_similarity=jaccard,
+                    magnitude_weighted_jaccard=mw_jaccard,
+                    cosine_similarity=cosine.item(),
                     n_shared_active=int(n_shared),
                     n_domain_a_specific=int(n_a_only),
                     n_domain_b_specific=int(n_b_only),
                     n_both_inactive=int(n_neither),
                     magnitude_correlation=pearson.item(),
                 ))
-                jaccards.append(jaccard)
+                jaccards.append(mw_jaccard)  # use magnitude-weighted as primary metric
 
-        all_active = torch.stack([active[d] for d in domains]).all(dim=0)
         all_inactive = torch.stack([inactive[d] for d in domains]).all(dim=0)
+
+        # Universal neurons: those where firing rates are *balanced* across all domains
+        # (min / max > 0.7). This avoids overcounting neurons that fire equally little
+        # in every domain; it requires genuinely proportional firing everywhere.
+        rates_stack = torch.stack([rates[d].float() for d in domains])  # [D_num, n_neurons]
+        min_rates = rates_stack.min(dim=0).values
+        max_rates = rates_stack.max(dim=0).values
+        balance_ratio = min_rates / (max_rates + 1e-10)
+        n_universal = int((balance_ratio > 0.7).sum().item())
 
         overview_reports.append(DomainOverviewReport(
             layer_idx=layer_idx,
-            n_universal_neurons=int(all_active.sum().item()),
+            n_universal_neurons=n_universal,
             n_dead_across_all=int(all_inactive.sum().item()),
             mean_pairwise_jaccard=float(np.mean(jaccards)),
             domain_specificity_score=float(1.0 - np.mean(jaccards)),

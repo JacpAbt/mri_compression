@@ -6,9 +6,11 @@ Merges redundant neurons via hierarchical clustering.
 
 from __future__ import annotations
 import logging
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .._utils import get_mlp_modules
 
@@ -18,11 +20,48 @@ logger = logging.getLogger(__name__)
 class NeuronMerger:
     @staticmethod
     @torch.no_grad()
-    def merge(layer, activations, target_width, device, chunk_size=1024):
+    def _compute_weight_sim(layer, n: int) -> Optional[torch.Tensor]:
+        """Column-wise cosine similarity of down_proj weights (CPU, float32).
+
+        Returns an ``(n, n)`` tensor or ``None`` if unavailable.
+        The result is aligned with activation dimension: column j = neuron j's
+        output vector into the residual stream.
+        """
+        try:
+            mlp = get_mlp_modules(layer)
+            if "down_proj" not in mlp:
+                return None
+            W = mlp["down_proj"].weight.data.float().cpu()  # (hidden, intermediate) standard
+            if W.shape[0] < W.shape[1]:
+                # Conv1D layout: (intermediate, hidden) — rows are output vectors
+                W_sampled = W[:n]                         # (n, hidden)
+                W_normed = F.normalize(W_sampled, dim=1)
+                return (W_normed @ W_normed.T).clamp(-1.0, 1.0)  # (n, n)
+            else:
+                # Standard layout: (hidden, intermediate)
+                W_sampled = W[:, :n]                      # (hidden, n)
+                W_normed = F.normalize(W_sampled, dim=0)
+                return (W_normed.T @ W_normed).clamp(-1.0, 1.0)  # (n, n)
+        except Exception:
+            return None
+
+    @staticmethod
+    @torch.no_grad()
+    def merge(layer, activations, target_width, device, chunk_size=1024, alpha: float = 0.6):
+        """Merge neurons using combined activation + weight-output similarity.
+
+        Args:
+            alpha: Weight of activation similarity (default 0.6).  The remaining
+                ``1 - alpha`` goes to weight-output similarity, which prevents
+                merging neurons that fire together but write different things into
+                the residual stream.
+        """
         n = activations.shape[1]
         if target_width >= n:
             return n, activations
-        clusters = NeuronMerger._cluster(activations, target_width, device, chunk_size)
+        weight_sim = NeuronMerger._compute_weight_sim(layer, n)
+        clusters = NeuronMerger._cluster(activations, target_width, device, chunk_size,
+                                         weight_sim=weight_sim, alpha=alpha)
         NeuronMerger._apply_merge(layer, clusters, activations, device)
         importance = activations.abs().mean(dim=0)
         merged = torch.zeros(activations.shape[0], len(clusters),
@@ -37,15 +76,22 @@ class NeuronMerger:
         return len(clusters), merged
 
     @staticmethod
-    def _cluster(acts, target, device, chunk):
+    def _cluster(acts, target, device, chunk, weight_sim: Optional[torch.Tensor] = None,
+                 alpha: float = 0.6):
         n = acts.shape[1]
         acts_gpu = acts.to(device)
         norms = acts_gpu.norm(dim=0, keepdim=True).clamp(min=1e-8)
         acts_n = acts_gpu / norms
-        sim = torch.zeros(n, n, device=device)
+        act_sim = torch.zeros(n, n, device=device)
         for s in range(0, n, chunk):
             e = min(s + chunk, n)
-            sim[s:e] = acts_n[:, s:e].T @ acts_n
+            act_sim[s:e] = acts_n[:, s:e].T @ acts_n
+        if weight_sim is not None:
+            w_sim_gpu = weight_sim.to(device)
+            sim = alpha * act_sim + (1.0 - alpha) * w_sim_gpu
+            del w_sim_gpu
+        else:
+            sim = act_sim
         sim.fill_diagonal_(-float("inf"))
         members = [[i] for i in range(n)]
         cl_imp = acts_gpu.abs().mean(dim=0)  # stay on GPU
@@ -66,7 +112,7 @@ class NeuronMerger:
             cl_imp[i] = tw
             if (step + 1) % 1000 == 0:
                 logger.info(f"    Merge step {step+1}/{n - target}")
-        del sim, acts_gpu, acts_n
+        del sim, act_sim, acts_gpu, acts_n
         torch.cuda.empty_cache()
         return [m for m in members if m]
 

@@ -115,6 +115,7 @@ def run_compression_stage(
         enable_static_fold=config.enable_static_fold,
         enable_weight_sharing=config.enable_weight_sharing,
         domain_calibration_dataloader=domain_dataloader,
+        inspector=inspector,
     )
 
     result = compressor.compress()

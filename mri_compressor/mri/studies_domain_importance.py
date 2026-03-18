@@ -45,6 +45,7 @@ def compute_domain_wanda_scores_streaming(
     domain_datasets: Dict[str, TextDataset],
     batch_size: int = 4,
     max_batches: int = 16,
+    prior_results: Optional[Dict] = None,
 ) -> Dict[str, Dict[int, torch.Tensor]]:
     """
     Compute per-domain Wanda scores layer-by-layer (streaming).
@@ -65,17 +66,20 @@ def compute_domain_wanda_scores_streaming(
         if layer_idx % 6 == 0:
             print(f"    Layer {layer_idx}/{inspector.num_layers}...")
 
-        # Get weight norms once per layer (shared across domains)
+        # Get weight norms once per layer (shared across domains).
+        # Use L2 norm to match canonical Wanda: w_norm = ||W[:, j]||_2.
+        # The original used L1 (.abs().mean()), which is inconsistent with the
+        # L2 activation norm used below; L2 × L2 matches Sun et al. (Wanda paper).
         down_w = inspector.mlp_layers[layer_idx].down_proj.weight.data.cpu().float()
         # down_proj: [hidden_size, intermediate_size]
         # Weight norm per neuron (column norm)
         intermediate_size = down_w.shape[1] if down_w.shape[0] < down_w.shape[1] else down_w.shape[0]
         if down_w.shape[0] == intermediate_size:
-            # Conv1D layout: (intermediate, hidden) -> row norms
-            weight_norm = down_w.abs().mean(dim=1)
+            # Conv1D layout: (intermediate, hidden) -> L2 row norms
+            weight_norm = down_w.norm(p=2, dim=1)
         else:
-            # Standard layout: (hidden, intermediate) -> column norms
-            weight_norm = down_w.abs().mean(dim=0)
+            # Standard layout: (hidden, intermediate) -> L2 column norms
+            weight_norm = down_w.norm(p=2, dim=0)
 
         for domain_name in domains:
             dataset = domain_datasets[domain_name]
@@ -138,8 +142,10 @@ def compute_domain_necessity(
         score_matrix = torch.stack([scores[d] for d in available])
         global_mean = score_matrix.mean(dim=0)
 
-        # Global median for safety gate
-        global_median = global_mean.median().item()
+        # Per-layer safety gate: median of the cross-domain mean Wanda score for
+        # this specific layer. Computed fresh for each layer so early layers (with
+        # higher activation magnitudes) don't contaminate the threshold for late layers.
+        per_layer_median = global_mean.median().item()
 
         n_critical = {}
         n_unnecessary = {}
@@ -154,11 +160,11 @@ def compute_domain_necessity(
             critical_threshold = d_scores.topk(k_critical).values[-1].item()
             n_critical[d] = int((d_scores >= critical_threshold).sum().item())
 
-            # Domain-unnecessary: bottom unnecessary_pct AND below global median
+            # Domain-unnecessary: bottom unnecessary_pct AND below per-layer median
             k_unnecessary = int(n_neurons * unnecessary_pct)
             sorted_scores, _ = d_scores.sort()
             unnecessary_threshold = sorted_scores[min(k_unnecessary, n_neurons - 1)].item()
-            is_unnecessary = (d_scores <= unnecessary_threshold) & (d_scores < global_median)
+            is_unnecessary = (d_scores <= unnecessary_threshold) & (d_scores < per_layer_median)
             n_unnecessary[d] = int(is_unnecessary.sum().item())
 
         report = DomainWandaReport(
@@ -180,6 +186,7 @@ def run_domain_conditional_importance(
     max_batches: int = 16,
     samples_per_domain: int = 64,
     custom_domain_datasets: Optional[Dict[str, TextDataset]] = None,
+    prior_results: Optional[Dict] = None,
 ) -> Dict:
     """
     Study 22: Domain-Conditional Wanda Importance.
@@ -222,6 +229,7 @@ def run_domain_conditional_importance(
     domain_wanda = compute_domain_wanda_scores_streaming(
         inspector, domain_datasets,
         batch_size=batch_size, max_batches=max_batches,
+        prior_results=prior_results,
     )
 
     # Compute necessity metrics
