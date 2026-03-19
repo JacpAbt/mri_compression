@@ -49,7 +49,8 @@ from .operations import (
     StaticNeuronFolder,
     WeightSharer,
 )
-from ._utils import get_intermediate_size, get_mlp_modules, get_mlp_submodule, resolve_layer
+from ._utils import (get_intermediate_size, get_mlp_modules, get_mlp_submodule,
+                     resolve_layer, _find_attn_output_proj)
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,9 @@ class MRICompressor:
         self.enable_static_fold = enable_static_fold
         self.enable_weight_sharing = enable_weight_sharing
         self.inspector = inspector  # Optional ModelInspector for arch-agnostic layer resolution
+        # d_model needed to locate attention output projections (Studies 6+23)
+        _cfg = getattr(model, "config", None)
+        self.hidden_size: int = getattr(_cfg, "hidden_size", 0)
 
     def _get_layer(self, layer_idx: int) -> nn.Module:
         """Resolve a transformer layer using the inspector (or common fallbacks)."""
@@ -268,6 +272,60 @@ class MRICompressor:
         if self.inspector is not None and layer_idx < len(self.inspector.attn_layers):
             return self.inspector.attn_layers[layer_idx]
         return None
+
+    def _apply_attn_contrib_ops(
+        self,
+        layer: nn.Module,
+        lp: LayerPrescription,
+        lr: dict,
+    ) -> None:
+        """Apply hybrid-attention compression ops driven by Studies 6+19+23.
+
+        Study 6/19: Zero out rows [s:e] of the attention output projection
+        weight for channel groups flagged as low-magnitude contributors.
+        This effectively silences those output dimensions of the DeltaNet /
+        linear-attention mechanism without changing parameter count.
+
+        Study 23: Apply an in-place low-rank approximation to the attention
+        output projection using the effective rank from the attention
+        contribution eigenspectrum (rank_95 / d_model < 0.35 threshold).
+
+        Both operations are gated by ``self.enable_attn_pruning``.
+        Nothing is done when ``self.hidden_size == 0`` (unknown architecture).
+        """
+        if not self.enable_attn_pruning or self.hidden_size == 0:
+            return
+
+        # Study 6+19: zero low-magnitude output channel groups
+        if lp.attn_zero_channel_groups:
+            out_proj = _find_attn_output_proj(layer, self.hidden_size)
+            if out_proj is not None:
+                for (s, e) in lp.attn_zero_channel_groups:
+                    out_proj.weight.data[s:e] = 0.0
+                    if out_proj.bias is not None:
+                        out_proj.bias.data[s:e] = 0.0
+                n_groups = len(lp.attn_zero_channel_groups)
+                lr["attn_channel_groups_zeroed"] = n_groups
+                logger.info(
+                    f"    Layer {lp.layer_idx}: zeroed {n_groups} attn output "
+                    f"channel group(s) (Studies 6+19)"
+                )
+
+        # Study 23: in-place low-rank approximation of attention output proj
+        if lp.attn_output_proj_low_rank and lp.attn_output_proj_target_rank:
+            out_proj = _find_attn_output_proj(layer, self.hidden_size)
+            if out_proj is not None:
+                applied = LowRankFactorizer.factorize_module(
+                    out_proj,
+                    target_rank=lp.attn_output_proj_target_rank,
+                    device=self.device,
+                )
+                if applied:
+                    lr["attn_output_proj_low_rank"] = 1
+                    logger.info(
+                        f"    Layer {lp.layer_idx}: low-rank attn output proj "
+                        f"→ rank {lp.attn_output_proj_target_rank} (Study 23)"
+                    )
 
     def compress(self) -> CompressionResult:
         t0 = time.perf_counter()
@@ -334,6 +392,9 @@ class MRICompressor:
             "depth_pruned": 0, "low_rank_applied": 0,
             "neurons_folded": 0, "domain_unnecessary_removed": 0,
             "reconstruction_mse": None,
+            # Studies 6+19+23: hybrid attention contrib compression
+            "attn_channel_groups_zeroed": 0,
+            "attn_output_proj_low_rank": 0,
         }
 
         logger.info(f"  Layer {lp.layer_idx}: {lp.strategy.name}")
@@ -415,6 +476,9 @@ class MRICompressor:
                     attn_info=self._get_attn_info(lp.layer_idx))
                 lr["attn_heads_pruned"] = len(pruned)
                 logger.info(f"    Pruned {len(pruned)} attention heads: {pruned}")
+
+            # Hybrid attention contrib compression (Studies 6+19+23)
+            self._apply_attn_contrib_ops(layer, lp, lr)
             return lr
 
         # ---- Domain specialization: remove domain-unnecessary neurons ----
@@ -504,6 +568,8 @@ class MRICompressor:
                 if ranks:
                     lr["low_rank_applied"] = 1
 
+            # Hybrid attention contrib compression (Studies 6+19+23)
+            self._apply_attn_contrib_ops(layer, lp, lr)
             return lr
 
         # ---- Determine if lossy (needs reconstruction targets) ----
@@ -667,6 +733,9 @@ class MRICompressor:
                     layer, lp.low_rank_target, self.device)
             if ranks:
                 lr["low_rank_applied"] = 1
+
+        # ---- Hybrid attention contrib compression (Studies 6+19+23) ----
+        self._apply_attn_contrib_ops(layer, lp, lr)
 
         del activations, mlp_io
         gc.collect()

@@ -184,32 +184,66 @@ def build_summary(
         }
 
     # ---- Study 6: Attention Head Importance ----
+    # Handles both HeadImportanceReport (standard layers) and
+    # LinearAttentionChannelReport (DeltaNet layers from the Study 6 extension).
     if "attention_heads" in results:
         heads = results["attention_heads"]
-        by_layer = {}
+        by_layer: dict = {}
+        linear_by_layer: dict = {}   # layer_idx → list[LinearAttentionChannelReport]
+
         for r in heads:
-            if r.layer_idx not in by_layer:
-                by_layer[r.layer_idx] = []
-            by_layer[r.layer_idx].append({
-                "head_idx": r.head_idx,
-                "mean_entropy": r.mean_entropy,
-                "first_token_attention": r.first_token_attention,
-                "max_attention_concentration": r.max_attention_concentration,
-            })
-            # Add attention sinks to protection list
-            if r.first_token_attention > 0.5:
-                summary["protection_lists"]["never_prune_heads"].append({
-                    "layer": r.layer_idx,
-                    "head": r.head_idx,
-                    "reason": "attention_sink",
-                    "first_token_attn": r.first_token_attention,
+            is_linear = hasattr(r, "layer_type") and r.layer_type == "linear"
+            if not is_linear:
+                # Standard HeadImportanceReport
+                if r.layer_idx not in by_layer:
+                    by_layer[r.layer_idx] = []
+                by_layer[r.layer_idx].append({
+                    "head_idx": r.head_idx,
+                    "mean_entropy": r.mean_entropy,
+                    "first_token_attention": r.first_token_attention,
+                    "max_attention_concentration": r.max_attention_concentration,
+                    "type": "standard",
                 })
+                # Add attention sinks to protection list
+                if r.first_token_attention > 0.5:
+                    summary["protection_lists"]["never_prune_heads"].append({
+                        "layer": r.layer_idx,
+                        "head": r.head_idx,
+                        "reason": "attention_sink",
+                        "first_token_attn": r.first_token_attention,
+                    })
+            else:
+                # LinearAttentionChannelReport (DeltaNet)
+                if r.layer_idx not in by_layer:
+                    by_layer[r.layer_idx] = []
+                by_layer[r.layer_idx].append({
+                    "group_idx": r.group_idx,
+                    "channels": list(r.channels),
+                    "output_magnitude": r.output_magnitude,
+                    "output_fraction": r.output_fraction,
+                    "type": "linear",
+                })
+                linear_by_layer.setdefault(r.layer_idx, []).append(r)
 
         for layer_idx, head_data in by_layer.items():
             layer_key = str(layer_idx)
             if layer_key not in summary["per_layer"]:
                 summary["per_layer"][layer_key] = {}
             summary["per_layer"][layer_key]["study6_attention_heads"] = head_data
+
+        # --- Compression wiring: low-magnitude DeltaNet channel groups ---
+        # Threshold: output_fraction < 0.3 / num_groups
+        # (contributing < 30% of expected per-group share)
+        for layer_idx, lin_reports in linear_by_layer.items():
+            num_g = len(lin_reports)
+            threshold = 0.3 / max(num_g, 1)
+            low_mag = [list(r.channels) for r in lin_reports
+                       if r.output_fraction < threshold]
+            if low_mag:
+                layer_key = str(layer_idx)
+                if layer_key not in summary["per_layer"]:
+                    summary["per_layer"][layer_key] = {}
+                summary["per_layer"][layer_key]["study6_linear_low_magnitude_groups"] = low_mag
 
     # ---- Study 7: Gate-Wanda Correlation ----
     if "gate_wanda_correlation" in results:
@@ -426,20 +460,54 @@ def build_summary(
 
     if "head_clustering" in results:
         report = results["head_clustering"]
-        summary["aggregated"]["study19"] = {
+
+        # Retrieve the num_groups and d_group used during Study 19
+        num_groups_s19 = getattr(report, "num_groups", architecture.get("num_attention_heads", 8))
+        d_model_s19 = architecture.get("hidden_size", 0)
+        d_group_s19 = d_model_s19 // max(num_groups_s19, 1) if d_model_s19 else 0
+
+        layer_types_s19 = getattr(report, "layer_types", {})
+
+        # Aggregated block
+        agg19: dict = {
             "num_heads_total": report.num_heads_total,
             "num_clusters": report.num_clusters,
             "num_redundant_heads": report.num_redundant_heads,
-            "prunable_heads": [(l, h) for l, h in report.prunable_heads],
+            "prunable_heads": [(l, g) for l, g in report.prunable_heads],
+            "linear_layer_coverage": getattr(report, "linear_layer_coverage", 0.0),
         }
-        # Build per-layer prunable head sets
-        prunable_by_layer = {}
-        for l, h in report.prunable_heads:
-            prunable_by_layer.setdefault(str(l), []).append(h)
-        for layer_key, heads in prunable_by_layer.items():
+        if layer_types_s19:
+            # Serialize tuple keys to string for JSON
+            agg19["layer_types"] = {
+                f"{l}_{g}": lt for (l, g), lt in layer_types_s19.items()
+            }
+        summary["aggregated"]["study19"] = agg19
+
+        # Build per-layer prunable data (split standard vs DeltaNet)
+        prunable_std: dict = {}        # layer → [head_indices]
+        prunable_linear: dict = {}     # layer → [[start,end], ...]
+
+        for l, g in report.prunable_heads:
+            lt = layer_types_s19.get((l, g), "standard")
+            if lt == "standard":
+                prunable_std.setdefault(str(l), []).append(g)
+            else:
+                # Convert channel group index to (start, end) range
+                if d_group_s19 > 0:
+                    s = g * d_group_s19
+                    e = min((g + 1) * d_group_s19, d_model_s19)
+                    prunable_linear.setdefault(str(l), []).append([s, e])
+
+        for layer_key, heads in prunable_std.items():
             if layer_key not in summary["per_layer"]:
                 summary["per_layer"][layer_key] = {}
             summary["per_layer"][layer_key]["study19_prunable_heads"] = heads
+
+        for layer_key, groups in prunable_linear.items():
+            if layer_key not in summary["per_layer"]:
+                summary["per_layer"][layer_key] = {}
+            # Used by diagnostician to add to attn_zero_channel_groups
+            summary["per_layer"][layer_key]["study19_linear_prunable_groups"] = groups
 
     if "static_dynamic" in results:
         for r in results["static_dynamic"]:
@@ -525,6 +593,41 @@ def build_summary(
                     d: sum(r.n_domain_unnecessary.get(d, 0) for r in reports)
                     for d in domains
                 },
+            }
+
+    # ---- Study 23: Linear Attention Rank Analysis ----
+    if "linear_attention_rank" in results:
+        for r in results["linear_attention_rank"]:
+            layer_key = str(r.layer_idx)
+            if layer_key not in summary["per_layer"]:
+                summary["per_layer"][layer_key] = {}
+            summary["per_layer"][layer_key]["study23_attn_rank"] = {
+                "layer_type": r.layer_type,
+                "effective_rank": r.effective_rank,
+                "rank_90": r.rank_90,
+                "rank_95": r.rank_95,
+                "rank_99": r.rank_99,
+                "total_dim": r.total_dim,
+                "compression_ratio": r.compression_ratio,
+            }
+
+        # Aggregated summary for Study 23
+        rank_results = results["linear_attention_rank"]
+        if rank_results:
+            candidates = [r for r in rank_results if r.compression_ratio < 0.35]
+            std_reports = [r for r in rank_results if r.layer_type == "standard"]
+            lin_reports = [r for r in rank_results if r.layer_type == "linear"]
+            summary["aggregated"]["study23"] = {
+                "n_low_rank_candidates": len(candidates),
+                "candidate_layers": [r.layer_idx for r in candidates],
+                "mean_compression_ratio_standard": (
+                    sum(r.compression_ratio for r in std_reports) / len(std_reports)
+                    if std_reports else 0.0
+                ),
+                "mean_compression_ratio_linear": (
+                    sum(r.compression_ratio for r in lin_reports) / len(lin_reports)
+                    if lin_reports else 0.0
+                ),
             }
 
     # ---- Build compression hints from study data ----

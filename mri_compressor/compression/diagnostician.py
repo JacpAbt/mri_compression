@@ -602,6 +602,35 @@ class MRIDiagnostician:
             n_domain_sensitive = s21.get("n_domain_sensitive_neurons", 0)
             domain_sensitivity_score = s21.get("domain_sensitivity_score", 0.0)
 
+            # Studies 6+19: DeltaNet channel groups for output-proj zeroing
+            # study6_linear_low_magnitude_groups: [[s0,e0], [s1,e1], ...]
+            # study19_linear_prunable_groups:     [[s0,e0], [s1,e1], ...]
+            # Both sources are merged (dedup) into attn_zero_channel_groups.
+            s6_low_mag = ld.get("study6_linear_low_magnitude_groups", None)
+            s19_linear = ld.get("study19_linear_prunable_groups", None)
+            attn_zero_groups = None
+            if self.enable_attn_pruning:
+                combined = []
+                if s6_low_mag:
+                    combined.extend([tuple(g) for g in s6_low_mag])
+                if s19_linear:
+                    for g in s19_linear:
+                        t = tuple(g)
+                        if t not in combined:
+                            combined.append(t)
+                if combined:
+                    attn_zero_groups = combined
+
+            # Study 23: Attention output projection low-rank factorization
+            # Threshold: compression_ratio (rank_95 / d_model) < 0.35
+            s23 = ld.get("study23_attn_rank", {})
+            attn_out_low_rank = False
+            attn_out_target_rank = None
+            if (s23 and self.enable_attn_pruning
+                    and s23.get("compression_ratio", 1.0) < 0.35):
+                attn_out_low_rank = True
+                attn_out_target_rank = s23.get("rank_95")
+
             # Protection lists — built per-layer from the restructured data
             protected_indices = protection_by_layer.get(layer_idx, None)
 
@@ -637,6 +666,10 @@ class MRIDiagnostician:
                 foldable_neuron_count=foldable_neuron_count,
                 foldable_neuron_indices=foldable_neuron_indices,
                 n_domain_sensitive_neurons=n_domain_sensitive,
+                # Studies 6+19+23: hybrid attention compression
+                attn_zero_channel_groups=attn_zero_groups,
+                attn_output_proj_low_rank=attn_out_low_rank,
+                attn_output_proj_target_rank=attn_out_target_rank,
             )
 
             # ---- Depth pruning ----

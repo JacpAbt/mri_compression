@@ -287,17 +287,25 @@ def plot_attention_heads(reports, num_layers: int, model_name: str, output_dir: 
         print("  No attention data to plot.")
         return
 
-    num_heads = max(r.head_idx for r in reports) + 1
+    # Study 6 may return a mix of HeadImportanceReport (standard softmax-attention)
+    # and LinearAttentionChannelReport (DeltaNet / linear-attention layers).
+    # Only HeadImportanceReport objects have head_idx / entropy fields; filter to those.
+    standard_reports = [r for r in reports if hasattr(r, 'head_idx')]
+    if not standard_reports:
+        print("  No standard-attention head data to plot (model may be fully linear-attention).")
+        return
+
+    num_heads = max(r.head_idx for r in standard_reports) + 1
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     fig.suptitle(f"Study 6: Attention Head Analysis — {model_name}", fontsize=14, fontweight='bold')
 
-    # Heatmap: entropy per head
+    # Heatmap: entropy per head (standard softmax-attention layers only)
     entropy_matrix = np.zeros((num_layers, num_heads))
     first_token_matrix = np.zeros((num_layers, num_heads))
     concentration_matrix = np.zeros((num_layers, num_heads))
 
-    for r in reports:
+    for r in standard_reports:
         entropy_matrix[r.layer_idx, r.head_idx] = r.mean_entropy
         first_token_matrix[r.layer_idx, r.head_idx] = r.first_token_attention
         concentration_matrix[r.layer_idx, r.head_idx] = r.max_attention_concentration
@@ -397,14 +405,15 @@ def plot_layer_redundancy(reports, model_name: str, output_dir: str):
     mlp_reports = sorted([r for r in reports if r.component == "mlp"], key=lambda r: r.layer_idx)
     attn_reports = sorted([r for r in reports if r.component == "attention"], key=lambda r: r.layer_idx)
 
-    x = np.arange(len(mlp_reports))
     width = 0.35
 
     if mlp_reports:
-        ax.bar(x - width/2, [r.ppl_delta for r in mlp_reports], width,
+        x_mlp = np.array([r.layer_idx for r in mlp_reports])
+        ax.bar(x_mlp - width/2, [r.ppl_delta for r in mlp_reports], width,
                label='MLP removed', color='#2196F3', alpha=0.7)
     if attn_reports:
-        ax.bar(x + width/2, [r.ppl_delta for r in attn_reports], width,
+        x_attn = np.array([r.layer_idx for r in attn_reports])
+        ax.bar(x_attn + width/2, [r.ppl_delta for r in attn_reports], width,
                label='Attention removed', color='#F44336', alpha=0.7)
 
     ax.set_xlabel('Layer')

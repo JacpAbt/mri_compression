@@ -564,12 +564,16 @@ class AttentionHeadClusterReport:
     num_clusters: int
     num_singleton_heads: int      # Heads that are unique (no cluster mates)
     num_redundant_heads: int      # Heads in clusters of size >= 2
-    prunable_heads: list[tuple[int, int]]  # (layer, head) — one representative kept per cluster
+    prunable_heads: list[tuple[int, int]]  # (layer, group) — one kept per cluster
     # Per-cluster info
     cluster_sizes: list[int]
-    cluster_members: list[list[tuple[int, int]]]  # Each cluster: list of (layer, head)
+    cluster_members: list[list[tuple[int, int]]]  # Each cluster: list of (layer, group)
     # Per-head similarity to nearest neighbor
-    head_nn_similarity: dict[tuple[int, int], float]  # (layer, head) → max sim to any other head
+    head_nn_similarity: dict[tuple[int, int], float]  # (layer, group) → max sim to any other
+    # New fields: hybrid-model support (default values for backward compatibility)
+    layer_types: dict = field(default_factory=dict)   # (layer,group) → "standard"/"linear"
+    linear_layer_coverage: float = 0.0               # fraction of layers with contrib data
+    num_groups: int = 8                               # channel groups used as "virtual heads"
 
 
 def _compute_head_signature(attn_patterns: torch.Tensor) -> torch.Tensor:
@@ -634,85 +638,131 @@ def run_attention_head_clustering(
     sample_layers: int | None = None,
 ) -> AttentionHeadClusterReport:
     """
-    Study 19: Cluster attention heads across all layers by functional
-    similarity. Heads doing similar work can be pruned.
+    Study 19: Cluster attention units across ALL layers by output-contribution
+    signature similarity. Works for both standard softmax-attention layers and
+    DeltaNet linear-attention layers.
+
+    Architecture-agnostic approach:
+      For each layer, compute the attention contribution via residual decomposition:
+        attn_contribution = (layer_output - layer_input) - mlp_output
+      Split d_model into channel groups (analogous to "virtual heads" for DeltaNet).
+      Compute a 7-dim signature per group:
+        [mean_mag, std_mag, p10, p50, p90, lag1_autocorr, near_zero_frac]
+      Cluster all units by cosine similarity of their signatures.
+
+    This replaces the old Q@K^T approach which crashed on DeltaNet layers.
     """
     print("\n" + "=" * 80)
-    print("STUDY 19: Attention Head Functional Clustering")
+    print("STUDY 19: Attention Head Functional Clustering (contribution-based)")
     print("=" * 80)
 
+    from .studies_hybrid_attention import _collect_attn_contribution
+
     num_layers = inspector.num_layers
-    num_heads = inspector.model.config.num_attention_heads
+    d_model = inspector.model.config.hidden_size
+
+    # Determine num_groups from first standard-attention layer; fall back to 8
+    num_groups = 8
+    for ai in inspector.attn_layers:
+        if ai is not None:
+            num_groups = ai.num_heads
+            break
+    d_group = d_model // num_groups
 
     if sample_layers is not None:
-        # Sample evenly-spaced layers
         indices = np.linspace(0, num_layers - 1, sample_layers, dtype=int)
-        layer_indices = sorted(set(indices))
+        layer_indices = sorted(set(indices.tolist()))
     else:
         layer_indices = list(range(num_layers))
 
-    # Collect attention signatures per layer
-    all_signatures = {}  # (layer, head) → signature vector
-    all_sigs_list = []
-    head_ids = []
+    # Collect contribution-based signatures per layer and channel group
+    all_sigs_list: list[torch.Tensor] = []
+    head_ids: list[tuple[int, int]] = []        # (layer, group_idx)
+    all_layer_types: dict[tuple[int, int], str] = {}
+    layers_with_data = 0
 
     for li in layer_indices:
         t0 = time.time()
-        patterns = _stream_attention_patterns(
-            inspector, dataset, batch_size, max_batches, li
-        )
-        if patterns is None:
-            print(f"  Layer {li}: Could not collect attention patterns (skipping)")
+        try:
+            contrib = _collect_attn_contribution(
+                inspector, li, dataset, batch_size, max_batches
+            )
+        except Exception as e:
+            print(f"  Layer {li:2d}: contribution collection failed ({e}), skipping")
             continue
 
-        # Compute signatures
-        sigs = _compute_head_signature(patterns)  # [num_heads, sig_dim]
-        for h in range(sigs.shape[0]):
-            head_ids.append((li, h))
-            all_sigs_list.append(sigs[h])
+        layer_type = "standard" if inspector.attn_layers[li] is not None else "linear"
+        layers_with_data += 1
 
-        del patterns
+        for g in range(num_groups):
+            s = g * d_group
+            e = min((g + 1) * d_group, d_model)
+            # Per-token magnitude of this channel group
+            ch_mags = contrib[:, s:e].norm(dim=1)  # [total_tokens]
+
+            mean_mag = ch_mags.mean().item()
+            std_mag = ch_mags.std().item()
+            p10 = float(ch_mags.quantile(0.10))
+            p50 = float(ch_mags.quantile(0.50))
+            p90 = float(ch_mags.quantile(0.90))
+            var = ch_mags.var().item() + 1e-8
+            autocorr = (
+                float((ch_mags[:-1] * ch_mags[1:]).mean() / var)
+                if len(ch_mags) > 1 else 0.0
+            )
+            near_zero = float((ch_mags < 0.01).float().mean())
+
+            sig = torch.tensor(
+                [mean_mag, std_mag, p10, p50, p90, autocorr, near_zero],
+                dtype=torch.float,
+            )
+            head_ids.append((li, g))
+            all_sigs_list.append(sig)
+            all_layer_types[(li, g)] = layer_type
+
+        del contrib
         gc.collect()
         torch.cuda.empty_cache()
-        print(f"  Layer {li:2d}: collected {sigs.shape[0]} head signatures ({time.time()-t0:.1f}s)")
+        print(f"  Layer {li:2d} ({layer_type:8s}): {num_groups} group signatures "
+              f"({time.time()-t0:.1f}s)")
 
     if not all_sigs_list:
-        print("  WARNING: No attention patterns collected. Model may not support output_attentions.")
+        print("  WARNING: No contribution data collected for any layer.")
         return AttentionHeadClusterReport(
             num_heads_total=0, num_clusters=0, num_singleton_heads=0,
             num_redundant_heads=0, prunable_heads=[], cluster_sizes=[],
             cluster_members=[], head_nn_similarity={},
+            layer_types={}, linear_layer_coverage=0.0, num_groups=num_groups,
         )
 
     # Stack all signatures and compute pairwise cosine similarity
-    sig_matrix = torch.stack(all_sigs_list)  # [total_heads, sig_dim]
+    sig_matrix = torch.stack(all_sigs_list)          # [total_units, 7]
     sig_norm = F.normalize(sig_matrix, dim=1)
-    sim = sig_norm @ sig_norm.T  # [total_heads, total_heads]
-    sim.fill_diagonal_(-1)  # Exclude self
+    sim = sig_norm @ sig_norm.T                       # [total_units, total_units]
+    sim.fill_diagonal_(-1)                            # Exclude self-similarity
 
-    # Nearest-neighbor similarity per head
-    nn_sim = {}
-    for i, (li, hi) in enumerate(head_ids):
-        nn_sim[(li, hi)] = float(sim[i].max())
+    # Nearest-neighbor similarity per unit
+    nn_sim: dict[tuple[int, int], float] = {}
+    for i, uid in enumerate(head_ids):
+        nn_sim[uid] = float(sim[i].max())
 
     # Greedy agglomerative clustering at similarity_threshold
     n = len(head_ids)
-    cluster_assignment = list(range(n))  # Each head starts in its own cluster
+    cluster_assignment = list(range(n))
     members = {i: [i] for i in range(n)}
 
-    # Sort all pairs by similarity (descending)
     pairs = []
     for i in range(n):
         for j in range(i + 1, n):
-            if sim[i, j] >= similarity_threshold:
-                pairs.append((float(sim[i, j]), i, j))
+            s_val = float(sim[i, j])
+            if s_val >= similarity_threshold:
+                pairs.append((s_val, i, j))
     pairs.sort(reverse=True)
 
     for _, i, j in pairs:
         ci, cj = cluster_assignment[i], cluster_assignment[j]
         if ci == cj:
             continue
-        # Merge smaller into larger
         if len(members[ci]) < len(members[cj]):
             ci, cj = cj, ci
         for idx in members[cj]:
@@ -720,22 +770,21 @@ def run_attention_head_clustering(
         members[ci].extend(members[cj])
         del members[cj]
 
-    # Build cluster results
+    # Build final cluster structures
     clusters_final = list(members.values())
-    cluster_members = [
-        [head_ids[idx] for idx in cl] for cl in clusters_final
-    ]
+    cluster_members_out = [[head_ids[idx] for idx in cl] for cl in clusters_final]
     cluster_sizes = [len(cl) for cl in clusters_final]
 
     singletons = sum(1 for s in cluster_sizes if s == 1)
     redundant = sum(s - 1 for s in cluster_sizes if s > 1)
 
     # Prunable: all but one from each multi-member cluster
-    prunable = []
-    for cl in cluster_members:
+    prunable: list[tuple[int, int]] = []
+    for cl in cluster_members_out:
         if len(cl) > 1:
-            # Keep the one with highest entropy (most informative)
-            prunable.extend(cl[1:])  # Simple: keep first, prune rest
+            prunable.extend(cl[1:])   # Keep first, mark rest prunable
+
+    linear_layer_cov = layers_with_data / max(num_layers, 1)
 
     report = AttentionHeadClusterReport(
         num_heads_total=len(head_ids),
@@ -744,25 +793,32 @@ def run_attention_head_clustering(
         num_redundant_heads=redundant,
         prunable_heads=prunable,
         cluster_sizes=sorted(cluster_sizes, reverse=True),
-        cluster_members=cluster_members,
+        cluster_members=cluster_members_out,
         head_nn_similarity=nn_sim,
+        layer_types=all_layer_types,
+        linear_layer_coverage=round(linear_layer_cov, 4),
+        num_groups=num_groups,
     )
 
-    print(f"\n  Total heads analyzed: {len(head_ids)}")
+    std_layers = sum(1 for ai in inspector.attn_layers if ai is not None)
+    lin_layers = inspector.num_layers - std_layers
+    print(f"\n  Total units analyzed: {len(head_ids)} "
+          f"({std_layers} std layers × {num_groups} + {lin_layers} linear layers × {num_groups})")
     print(f"  Clusters found: {len(clusters_final)} "
           f"(singletons={singletons}, multi-member={len(clusters_final)-singletons})")
-    print(f"  Redundant (prunable) heads: {redundant}")
+    print(f"  Redundant (prunable) units: {redundant}")
+    print(f"  Layer coverage: {linear_layer_cov:.1%} ({layers_with_data}/{num_layers})")
     if cluster_sizes:
-        print(f"  Largest cluster: {max(cluster_sizes)} heads")
-        # Print top 5 largest clusters
-        for i, (sz, members) in enumerate(
-            sorted(zip(cluster_sizes, cluster_members), reverse=True)[:5]
+        print(f"  Largest cluster: {max(cluster_sizes)} units")
+        for i, (sz, cl) in enumerate(
+            sorted(zip(cluster_sizes, cluster_members_out), reverse=True)[:5]
         ):
             if sz > 1:
-                member_str = ", ".join(f"L{l}H{h}" for l, h in members[:6])
+                ltype = all_layer_types.get(cl[0], "?")
+                member_str = ", ".join(f"L{l}G{g}" for l, g in cl[:6])
                 if sz > 6:
                     member_str += f", ... ({sz} total)"
-                print(f"    Cluster {i+1} (size={sz}): {member_str}")
+                print(f"    Cluster {i+1} (size={sz}, {ltype}): {member_str}")
 
     return report
 

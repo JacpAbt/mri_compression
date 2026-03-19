@@ -107,16 +107,17 @@ def run_functional_redundancy_census(
         # Two neurons may fire together yet write different things — weight_sim catches this.
         mlp_info = inspector.mlp_layers[layer_idx]
         W_out = mlp_info.down_proj.weight.data.float().cpu()
-        if W_out.shape[0] < W_out.shape[1]:
-            # Conv1D layout: (intermediate, hidden) — rows are per-neuron output vectors
-            W_out_sampled = W_out[neuron_idx]                       # (k, hidden)
-            W_out_normed = F.normalize(W_out_sampled, dim=1)
-            weight_sim = W_out_normed @ W_out_normed.T              # (k, k)
-        else:
-            # Standard layout: (hidden, intermediate) — columns are per-neuron output vectors
+        if W_out.shape[0] > W_out.shape[1]:
+            # Standard PyTorch layout: (out_features, in_features) = (hidden, intermediate)
+            # Columns are per-neuron output vectors written to the residual stream
             W_out_sampled = W_out[:, neuron_idx]                    # (hidden, k)
             W_out_normed = F.normalize(W_out_sampled, dim=0)
             weight_sim = W_out_normed.T @ W_out_normed              # (k, k)
+        else:
+            # Conv1D / transposed layout: (intermediate, hidden) — rows are per-neuron output vectors
+            W_out_sampled = W_out[neuron_idx]                       # (k, hidden)
+            W_out_normed = F.normalize(W_out_sampled, dim=1)
+            weight_sim = W_out_normed @ W_out_normed.T              # (k, k)
         weight_sim.fill_diagonal_(0.0)
         weight_sim = weight_sim.to(act_sim.device)
 

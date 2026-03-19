@@ -90,3 +90,61 @@ class LowRankFactorizer:
                         f"(saving {saving:.1%}, {original_params:,} -> {actual_params:,} params)")
 
         return results
+
+    @staticmethod
+    @torch.no_grad()
+    def factorize_module(
+        mod: nn.Linear,
+        target_rank: int,
+        device: torch.device,
+        energy_threshold: float = 0.99,
+    ) -> bool:
+        """
+        In-place low-rank approximation of a single nn.Linear weight matrix.
+
+        Replaces mod.weight.data with its rank-r SVD approximation:
+            W ≈ U[:,:r] @ diag(S[:r]) @ Vh[:r,:]
+
+        Unlike factorize_mlp, this keeps the same module structure (no
+        Sequential replacement) so it can be applied to modules found via
+        _find_attn_output_proj without needing a reference to the parent.
+
+        Returns True if the approximation was applied, False if skipped
+        (e.g. target_rank is already close to full rank).
+        """
+        if not isinstance(mod, nn.Linear):
+            return False
+
+        W = mod.weight.data.float().to(device)
+        m, n = W.shape  # [out_features, in_features]
+
+        # Skip if rank is essentially full
+        rank = min(target_rank, min(m, n))
+        if rank >= min(m, n) * 0.95:
+            return False
+
+        # Truncated SVD
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        # U: [m, k], S: [k], Vh: [k, n] where k = min(m, n)
+
+        # Optionally reduce rank further to capture energy_threshold
+        total_energy = (S ** 2).sum()
+        if total_energy > 0:
+            cumulative = (S ** 2).cumsum(0) / total_energy
+            rank_for_energy = int((cumulative < energy_threshold).sum().item()) + 1
+            rank = min(rank, rank_for_energy)
+
+        if rank >= min(m, n) * 0.95:
+            return False
+
+        # Reconstruct rank-r approximation in-place
+        W_approx = (U[:, :rank] * S[:rank].unsqueeze(0)) @ Vh[:rank, :]
+        mod.weight.data.copy_(W_approx.to(mod.weight.dtype))
+
+        orig_rank = min(m, n)
+        savings_pct = (1 - rank / orig_rank) * 100
+        logger.info(
+            f"    factorize_module: rank {orig_rank} -> {rank} "
+            f"({savings_pct:.1f}% rank reduction, {m}x{n} matrix)"
+        )
+        return True

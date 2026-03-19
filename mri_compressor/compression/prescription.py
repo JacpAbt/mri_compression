@@ -8,7 +8,7 @@ Extracted from compression_v2/diagnostics.py.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 
 class CompressionStrategy(Enum):
@@ -71,6 +71,11 @@ class LayerPrescription:
     domain_unnecessary_count: int = 0                # Number of domain-unnecessary neurons to remove
     domain_unnecessary_indices: Optional[list] = None  # Specific indices to remove
     target_domain: Optional[str] = None              # Target domain for this layer
+
+    # Studies 6+23: Hybrid attention compression (DeltaNet / linear-attention layers)
+    attn_zero_channel_groups: Optional[List[Tuple[int, int]]] = None  # (start,end) channel ranges to zero in o_proj
+    attn_output_proj_low_rank: bool = False           # Apply SVD approximation to attn output proj
+    attn_output_proj_target_rank: Optional[int] = None  # Target rank for SVD approximation
 
 
 @dataclass

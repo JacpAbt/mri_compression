@@ -79,7 +79,7 @@ class ModelInspector:
     def _detect_architecture(self):
         """Auto-detect model architecture and build layer maps."""
         self.mlp_layers: List[MLPInfo] = []
-        self.attn_layers: List[AttentionInfo] = []
+        self.attn_layers: List[Optional[AttentionInfo]] = []
         self.num_layers = 0
         
         # Try to find the transformer layers
@@ -109,8 +109,12 @@ class ModelInspector:
         print(f"  Architecture: {arch_type}")
         print(f"  Activation: {self.mlp_layers[0].activation_fn}")
         print(f"  Intermediate size: {self.mlp_layers[0].intermediate_size}")
-        print(f"  Attention heads: {self.attn_layers[0].num_heads} "
-              f"(KV heads: {self.attn_layers[0].num_kv_heads})")
+        first_attn = next((a for a in self.attn_layers if a is not None), None)
+        if first_attn:
+            print(f"  Attention heads: {first_attn.num_heads} "
+                  f"(KV heads: {first_attn.num_kv_heads})")
+        else:
+            print("  Attention: all linear (no pruneable heads)")
         print(f"  Model dtype: {self.dtype}")
     
     def _parse_mlp(self, idx: int, layer):
@@ -159,13 +163,28 @@ class ModelInspector:
     def _parse_attention(self, idx: int, layer):
         """Parse attention structure from a transformer layer."""
         attn = None
-        for attr in ['self_attn', 'attn', 'attention']:
+        for attr in ['self_attn', 'attn', 'attention', 'self_attention']:
             if hasattr(layer, attr):
                 attn = getattr(layer, attr)
                 break
-        
+
         if attn is None:
-            raise ValueError(f"Cannot find attention in layer {idx}")
+            # Generic fallback: child must have BOTH an input projection (q_proj/c_attn) AND
+            # an output projection (o_proj/c_proj) — requiring both prevents false-positives
+            # on Gated DeltaNet or other linear-attention modules that have q_proj but no o_proj.
+            for _, mod in layer.named_children():
+                has_in = hasattr(mod, 'q_proj') or hasattr(mod, 'c_attn')
+                has_out = hasattr(mod, 'o_proj') or hasattr(mod, 'c_proj')
+                if has_in and has_out:
+                    attn = mod
+                    break
+
+        if attn is None:
+            # Hybrid model (e.g. Qwen3.5 DeltaNet layers): no pruneable standard attention
+            # in this layer — store None and continue gracefully.
+            print(f"  Layer {idx}: linear/non-standard attention, skipping head pruning.")
+            self.attn_layers.append(None)
+            return
         
         q_proj = getattr(attn, 'q_proj', None) or getattr(attn, 'c_attn', None)
         k_proj = getattr(attn, 'k_proj', None)

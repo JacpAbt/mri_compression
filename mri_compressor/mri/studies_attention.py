@@ -151,9 +151,12 @@ def run_attention_head_importance(
         )
         reports.append(report)
 
-    # Print summary per layer
+    # Print summary per layer (standard-attention layers only)
     for layer_idx in range(inspector.num_layers):
         layer_reports = [r for r in reports if r.layer_idx == layer_idx]
+        if not layer_reports:
+            # DeltaNet / linear-attention layer — no standard head data
+            continue
         avg_entropy = np.mean([r.mean_entropy for r in layer_reports])
         avg_first = np.mean([r.first_token_attention for r in layer_reports])
         max_first = max([r.first_token_attention for r in layer_reports])
@@ -162,5 +165,19 @@ def run_attention_head_importance(
               f"avg_first_token_attn={avg_first:.3f}, "
               f"max_first_token_attn={max_first:.3f}, "
               f"most_focused_head={min_entropy_head.head_idx}")
+
+    # --- Study 6 Extension: analyze DeltaNet / linear-attention layers ---
+    # run_linear_attention_analysis only processes layers where attn_layers[i] is None,
+    # so it is a no-op on purely standard-attention models.
+    try:
+        from .studies_hybrid_attention import run_linear_attention_analysis
+        linear_reports = run_linear_attention_analysis(
+            inspector, dataset, batch_size, max_batches
+        )
+        reports.extend(linear_reports)
+    except Exception as e:
+        import traceback
+        print(f"  WARNING: linear attention extension failed: {e}")
+        traceback.print_exc()
 
     return reports

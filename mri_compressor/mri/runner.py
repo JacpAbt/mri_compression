@@ -266,6 +266,14 @@ class MRIRunner:
                 prior_results=self.results,
             )
 
+        elif study_num == 23:
+            from .studies_hybrid_attention import run_linear_attention_rank_analysis
+            self.results["linear_attention_rank"] = run_linear_attention_rank_analysis(
+                self.inspector, self.dataset,
+                batch_size=self.config.batch_size,
+                max_batches=self.config.max_batches,
+            )
+
         else:
             print(f"  Unknown study number: {study_num}")
             return
@@ -345,6 +353,11 @@ class MRIRunner:
                 print(f"  ERROR in Study {study_num}: {e}")
                 import traceback
                 traceback.print_exc()
+                # If run_study entered a no_grad context but crashed before
+                # __exit__, torch.no_grad() stays active permanently and breaks
+                # any subsequent operation that needs gradients (e.g. LocalReconstructor).
+                if not torch.is_grad_enabled():
+                    torch.set_grad_enabled(True)
 
     def save(self, output_dir: str) -> dict:
         """Save enriched summary and generate plots."""
