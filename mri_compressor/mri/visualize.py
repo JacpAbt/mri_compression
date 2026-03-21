@@ -1220,6 +1220,238 @@ def plot_critical_neurons(reports, model_name: str, output_dir: str):
 # Master dispatch
 # ---------------------------------------------------------------------------
 
+def plot_study24_domain_compression_curve(curve_result: dict, model_name: str, output_dir: str):
+    """
+    Study 24: Domain Compression Curve.
+
+    Two sub-plots:
+      Left:  Per-layer PPL curves at each sparsity level (heatmap style).
+      Right: Per-layer safe sparsity bar chart with 5% baseline reference.
+    """
+    set_style()
+    reports = curve_result.get("reports", [])
+    if not reports:
+        print("  [Study 24] No reports to plot.")
+        return
+
+    domain_name = curve_result.get("domain_name", "domain")
+    sparsity_levels = curve_result.get("sparsity_levels", [])
+    baseline_ppl = curve_result.get("baseline_ppl", 1.0)
+
+    layer_indices = [r.layer_idx for r in reports]
+    safe_sparsities = [r.safe_domain_sparsity for r in reports]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle(
+        f"Study 24: Domain Compression Curve — {model_name}\n"
+        f"Domain: {domain_name}  |  Baseline PPL: {baseline_ppl:.3f}",
+        fontsize=13, fontweight="bold",
+    )
+
+    # ---- Left: PPL heatmap (layers × sparsity levels) ----
+    ax = axes[0]
+    if sparsity_levels:
+        ppl_matrix = np.array([
+            [p / baseline_ppl for p in r.domain_ppl_curve]
+            for r in reports
+        ])  # shape (n_layers, n_sparsity_levels)
+        im = ax.imshow(
+            ppl_matrix, aspect="auto", cmap="RdYlGn_r",
+            vmin=1.0, vmax=max(1.5, float(ppl_matrix.max())),
+            origin="upper",
+        )
+        ax.set_xticks(range(len(sparsity_levels)))
+        ax.set_xticklabels([f"{s:.0%}" for s in sparsity_levels])
+        ax.set_yticks(range(len(layer_indices)))
+        ax.set_yticklabels(layer_indices, fontsize=8)
+        ax.set_xlabel("Sparsity Level")
+        ax.set_ylabel("Layer")
+        ax.set_title("Relative Domain PPL (1.0 = baseline)\nGreen = safe, Red = degraded")
+        fig.colorbar(im, ax=ax, label="PPL / Baseline PPL", shrink=0.8)
+
+        # Mark the safe/unsafe boundary per row
+        for row_i, r in enumerate(reports):
+            safe_sp = r.safe_domain_sparsity
+            if safe_sp > 0 and safe_sp in sparsity_levels:
+                col_i = sparsity_levels.index(safe_sp)
+                ax.add_patch(plt.Rectangle(
+                    (col_i - 0.5, row_i - 0.5), 1, 1,
+                    fill=False, edgecolor="blue", linewidth=1.5, linestyle="--",
+                ))
+    else:
+        ax.text(0.5, 0.5, "No sparsity data", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12)
+        ax.set_title("PPL Heatmap")
+
+    # ---- Right: Per-layer safe sparsity bar chart ----
+    ax = axes[1]
+    colors = ["#4CAF50" if s > 0.05 else ("#FF9800" if s > 0.0 else "#F44336")
+              for s in safe_sparsities]
+    ax.barh(layer_indices, [s * 100 for s in safe_sparsities],
+            color=colors, alpha=0.8, height=0.7)
+    ax.axvline(x=5.0, color="gray", linestyle="--", linewidth=1.5,
+               label="Previous 5% fixed cap")
+    ax.set_xlabel("Safe Sparsity (%)")
+    ax.set_ylabel("Layer")
+    ax.set_title(
+        "Per-Layer Safe Neuron Sparsity\n"
+        "(Green > 5%  |  Orange 0–5%  |  Red = not safe)"
+    )
+    ax.legend(fontsize=9)
+    ax.invert_yaxis()
+
+    avg_safe = curve_result.get("avg_safe_sparsity", 0.0)
+    ax.text(
+        0.97, 0.02, f"avg = {avg_safe:.1%}",
+        transform=ax.transAxes, ha="right", va="bottom",
+        fontsize=10, color="darkblue",
+    )
+
+    plt.tight_layout()
+    out_path = Path(output_dir) / "study24_domain_compression_curve.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  [Study 24] Saved: {out_path}")
+
+
+def plot_study25_write_vector_geometry(geo_result: dict, model_name: str, output_dir: str):
+    """
+    Study 25: MLP Write-Vector Geometry.
+
+    Up to four panels:
+      Panel 1 (top-left)  : Per-layer intrinsic_dim_95 (coloured by ratio to hidden_size)
+      Panel 2 (top-right) : Per-layer direction_coherence (0–1)
+      Panel 3 (bottom-left): Per-layer geom_importance_concentration
+      Panel 4 (bottom-right, optional): Cross-domain direction divergence in degrees
+    """
+    set_style()
+    layer_reports = geo_result.get("layer_reports", [])
+    if not layer_reports:
+        print("  [Study 25] No layer reports to plot.")
+        return
+
+    domain_divergences = geo_result.get("domain_divergences", {})
+    has_domain = bool(domain_divergences)
+
+    layers    = [r.layer_idx         for r in layer_reports]
+    dim95     = [r.intrinsic_dim_95  for r in layer_reports]
+    coherence = [r.direction_coherence for r in layer_reports]
+    concentr  = [r.geom_importance_concentration for r in layer_reports]
+
+    # Colour intrinsic_dim bars by fraction of hidden_size
+    hidden_sizes = [r.hidden_size for r in layer_reports]
+    ratios       = [d / max(h, 1) for d, h in zip(dim95, hidden_sizes)]
+    dim_colors   = [
+        "#1565C0" if ratio <= 0.10 else
+        "#4CAF50" if ratio <= 0.30 else
+        "#FF9800" if ratio <= 0.60 else
+        "#F44336"
+        for ratio in ratios
+    ]
+
+    n_cols = 2
+    n_rows = 2
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 10))
+    fig.suptitle(
+        f"Study 25: MLP Write-Vector Geometry — {model_name}",
+        fontsize=14, fontweight="bold",
+    )
+
+    # ── Panel 1: intrinsic_dim_95 ──────────────────────────────────────────
+    ax = axes[0, 0]
+    ax.barh(layers, dim95, color=dim_colors, alpha=0.85, height=0.7)
+    ax.set_xlabel("Intrinsic Dimension (95 % variance)")
+    ax.set_ylabel("Layer")
+    ax.set_title(
+        "Intrinsic Dimensionality of Write Vectors\n"
+        "Blue ≤10 %  |  Green 10–30 %  |  Orange 30–60 %  |  Red >60 %  (of hidden_size)"
+    )
+    ax.invert_yaxis()
+    # Annotate average
+    avg_dim = sum(dim95) / max(1, len(dim95))
+    ax.axvline(x=avg_dim, color="gray", linestyle="--", linewidth=1.2,
+               label=f"avg = {avg_dim:.0f}")
+    ax.legend(fontsize=9)
+
+    # ── Panel 2: direction_coherence ──────────────────────────────────────
+    ax = axes[0, 1]
+    coh_colors = [
+        "#1565C0" if c >= 0.7 else
+        "#4CAF50" if c >= 0.4 else
+        "#FF9800" if c >= 0.2 else
+        "#F44336"
+        for c in coherence
+    ]
+    ax.barh(layers, coherence, color=coh_colors, alpha=0.85, height=0.7)
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("Direction Coherence ‖E[Δ̂_l]‖₂  (0 = random, 1 = always same direction)")
+    ax.set_ylabel("Layer")
+    ax.set_title(
+        "Write-Vector Direction Coherence\n"
+        "High = specialist layer  |  Low = context-sensitive layer"
+    )
+    ax.invert_yaxis()
+    avg_coh = sum(coherence) / max(1, len(coherence))
+    ax.axvline(x=avg_coh, color="gray", linestyle="--", linewidth=1.2,
+               label=f"avg = {avg_coh:.3f}")
+    ax.legend(fontsize=9)
+
+    # ── Panel 3: geom_importance_concentration ────────────────────────────
+    ax = axes[1, 0]
+    conc_colors = [
+        "#1565C0" if c <= 0.10 else
+        "#4CAF50" if c <= 0.20 else
+        "#FF9800" if c <= 0.40 else
+        "#F44336"
+        for c in concentr
+    ]
+    ax.barh(layers, [c * 100 for c in concentr], color=conc_colors, alpha=0.85, height=0.7)
+    ax.set_xlabel("% of neurons carrying 80 % of geometric importance")
+    ax.set_ylabel("Layer")
+    ax.set_title(
+        "Geometric Importance Concentration\n"
+        "Low % = few neurons dominate (good pruning target)  |  High % = distributed"
+    )
+    ax.invert_yaxis()
+    avg_conc = sum(concentr) / max(1, len(concentr))
+    ax.axvline(x=avg_conc * 100, color="gray", linestyle="--", linewidth=1.2,
+               label=f"avg = {avg_conc:.1%}")
+    ax.legend(fontsize=9)
+
+    # ── Panel 4: cross-domain divergence (optional) ───────────────────────
+    ax = axes[1, 1]
+    if has_domain:
+        for domain_name, divergences in domain_divergences.items():
+            if len(divergences) == len(layers):
+                ax.plot(divergences, layers, "o-", label=domain_name, markersize=4)
+                # Annotate layers with divergence > 15° as domain-sensitive
+                for li, (ly, div) in enumerate(zip(layers, divergences)):
+                    if div > 15.0:
+                        ax.annotate(f"L{ly}", xy=(div, ly), xytext=(div + 1, ly),
+                                    fontsize=7, color="red")
+        ax.axvline(x=15.0, color="red", linestyle="--", linewidth=1.2,
+                   label="15° sensitivity threshold")
+        ax.set_xlabel("Direction Divergence (degrees)")
+        ax.set_ylabel("Layer")
+        ax.set_title(
+            "Domain vs Generic Write Direction\n"
+            "High angle → layer is domain-sensitive"
+        )
+        ax.invert_yaxis()
+        ax.legend(fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No domain comparison\n(run with --domain)", ha="center",
+                va="center", transform=ax.transAxes, fontsize=12, color="gray")
+        ax.set_title("Cross-Domain Direction Divergence")
+        ax.axis("off")
+
+    plt.tight_layout()
+    out_path = Path(output_dir) / "study25_write_vector_geometry.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  [Study 25] Saved: {out_path}")
+
+
 def generate_all_plots(results: dict, model_name: str, output_dir: str):
     """Generate all available plots from results dictionary."""
     print("\nGenerating visualizations...")
@@ -1377,5 +1609,21 @@ def generate_all_plots(results: dict, model_name: str, output_dir: str):
             plot_study21_magnitude_divergence(results["magnitude_divergence"], model_name, output_dir)
         except Exception as e:
             print(f"  [Study 21] plot_study21_magnitude_divergence failed: {e}")
+
+    # Study 24
+    if "domain_compression_curve" in results:
+        try:
+            plot_study24_domain_compression_curve(
+                results["domain_compression_curve"], model_name, output_dir)
+        except Exception as e:
+            print(f"  [Study 24] plot_study24_domain_compression_curve failed: {e}")
+
+    # Study 25
+    if "write_vector_geometry" in results:
+        try:
+            plot_study25_write_vector_geometry(
+                results["write_vector_geometry"], model_name, output_dir)
+        except Exception as e:
+            print(f"  [Study 25] plot_study25_write_vector_geometry failed: {e}")
 
     print("Visualization complete!")

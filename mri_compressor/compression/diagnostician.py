@@ -464,10 +464,46 @@ class MRIDiagnostician:
             s5 = ld.get("study5_neuron_health", {})
             dead_count = s5.get("dead_count", 0)
             dormant_count = s5.get("dormant_count", 0)
+
+            # Study 11: cross-domain dead neurons — neurons confirmed dead across ALL domains
+            # are strictly more reliable than Study 5's single-calibration-set dead count.
+            # Take the max to avoid double-counting while still capturing neurons Study 5
+            # may have missed (only run on the narrow calibration distribution).
+            s11 = ld.get("study11_domain_divergence", {})
+            n_dead_all_domains = s11.get("n_dead_across_all", 0)
+            if n_dead_all_domains > dead_count:
+                dead_count = n_dead_all_domains
+
             dead_frac = dead_count / intermediate_size if intermediate_size > 0 else 0
             dormant_frac = dormant_count / intermediate_size if intermediate_size > 0 else 0
             has_significant_dead = dead_frac > self.dead_frac_threshold
             has_significant_dormant = dormant_frac > self.dormant_frac_threshold
+
+            # Study 25: geometric importance — neurons with near-zero write contribution
+            # are geometrically inert even if their activation value is non-zero.
+            # Augment dead_count only if Study 25 evidence exceeds Studies 5+11 count.
+            s25 = ld.get("study25_write_vector_geometry", {})
+            geom_path = s25.get("geom_importance_path")
+            if geom_path:
+                _output_dir = summary.get("output_dir", "")
+                _full_gp = (
+                    os.path.join(_output_dir, geom_path)
+                    if _output_dir
+                    else geom_path
+                )
+                if os.path.exists(_full_gp):
+                    try:
+                        import torch as _torch
+                        _geom_imp = _torch.load(_full_gp, weights_only=True).float()
+                        # Neurons below 1% of median are geometrically inert
+                        _threshold = 0.01 * _geom_imp.median().item()
+                        _n_geom_dead = int((_geom_imp < _threshold).sum().item())
+                        if _n_geom_dead > dead_count:
+                            dead_count = _n_geom_dead
+                            dead_frac = dead_count / intermediate_size if intermediate_size > 0 else 0
+                            has_significant_dead = dead_frac > self.dead_frac_threshold
+                    except Exception:
+                        pass
 
             # Study 10: criticality
             s10 = ld.get("study10_layer_redundancy", {})
@@ -572,11 +608,22 @@ class MRIDiagnostician:
             avg_ratio95 = s18.get("avg_ratio95", 1.0)
             low_rank_ranks = None
             if avg_ratio95 < 0.90:
-                low_rank_ranks = {
-                    "gate_proj": s18.get("gate_proj_ratio95", 1.0),
-                    "up_proj": s18.get("up_proj_ratio95", 1.0),
-                    "down_proj": s18.get("down_proj_ratio95", 1.0),
-                }
+                # Per-projection selective ranks: only include projections with a clear
+                # low-rank structure (ratio95 < 0.50 → needs < 50% of full rank, i.e.
+                # ≥ 2× effective compression in that dimension). Projections absent from
+                # the dict will be SKIPPED by factorize_mlp (no loss on near-full-rank ones).
+                _PER_PROJ_LR_THRESH = 0.50
+                per_proj: dict = {}
+                for _pname, _pkey in [
+                    ("gate_proj", "gate_proj_ratio95"),
+                    ("up_proj",   "up_proj_ratio95"),
+                    ("down_proj", "down_proj_ratio95"),
+                ]:
+                    _ratio = s18.get(_pkey, 1.0)
+                    if _ratio < _PER_PROJ_LR_THRESH:
+                        per_proj[_pname] = int(_ratio * hidden_size)
+                if per_proj:
+                    low_rank_ranks = per_proj
 
             # Study 19: head clustering (prunable heads from cluster analysis)
             cluster_prunable_heads = ld.get("study19_prunable_heads", None)
@@ -809,6 +856,22 @@ class MRIDiagnostician:
                     lp.low_rank_target = target_rank
                     lp.low_rank_ranks = low_rank_ranks
 
+            # ---- Study 25: Dynamic rank refinement ----
+            # intrinsic_dim_95 measures the actual PCA rank of write vectors —
+            # i.e. how many dimensions the MLP actually uses during inference.
+            # If this is smaller than the static SVD estimate from Study 18,
+            # use the tighter (empirical) bound as the low_rank_target.
+            # Guard: only override when dim95 < 80% of hidden_size to avoid
+            # over-trusting small sample estimates.
+            intrinsic_dim_25 = s25.get("intrinsic_dim_95", 0)
+            if (
+                intrinsic_dim_25 > 0
+                and intrinsic_dim_25 < int(hidden_size * 0.80)
+                and lp.low_rank_target is not None
+                and intrinsic_dim_25 < lp.low_rank_target
+            ):
+                lp.low_rank_target = intrinsic_dim_25
+
             # ---- Study 20: Static neuron folding on LIGHT_TOUCH layers ----
             # The compressor only applies folding inside DEAD_REMOVAL_AND_MERGE
             # or DORMANT_REMOVAL. For LIGHT_TOUCH layers with foldable neurons,
@@ -849,6 +912,28 @@ class MRIDiagnostician:
             import torch
             output_dir = summary.get("output_dir", "")
             logger.info(f"  Domain specialization overlay for domain: {self.target_domain}")
+
+            # Study 25: pre-fetch per-layer domain divergence angle list once.
+            # domain_direction_divergences[domain][layer_idx] = angle in degrees.
+            # Used only for re-ranking candidates, never for budget scaling.
+            s25_agg_dom_div = (
+                summary.get("aggregated", {})
+                       .get("study25", {})
+                       .get("domain_direction_divergences", {})
+                       .get(self.target_domain, [])
+            )
+
+            # Model-average geom_importance_concentration across all layers (Study 25).
+            # Used for model-relative pool expansion: each layer is compared to its own
+            # model's average, not to any absolute threshold.
+            _s25_conc_vals = [
+                per_layer_raw.get(str(li), {})
+                             .get("study25_write_vector_geometry", {})
+                             .get("geom_importance_concentration")
+                for li in range(num_layers)
+            ]
+            _s25_conc_vals = [v for v in _s25_conc_vals if v is not None]
+            s25_avg_geom_conc = sum(_s25_conc_vals) / len(_s25_conc_vals) if _s25_conc_vals else 0.0
 
             for lp in prescriptions:
                 layer_key = str(lp.layer_idx)
@@ -901,10 +986,100 @@ class MRIDiagnostician:
                         except Exception:
                             pass
 
-                # Bottom K by domain Wanda AND below global median
-                max_removable = int(n_neurons * self.domain_unnecessary_removal_frac)
+                # Study 24: use per-layer evidence-based safe sparsity when available.
+                # Study 24 iteratively measures domain PPL at multiple sparsity levels
+                # and reports the highest level where PPL increase stays < 15%.
+                # This replaces the fixed domain_unnecessary_removal_frac (5%) cap
+                # with a per-layer budget grounded in actual measured PPL impact.
+                s24 = ld.get("study24_domain_compression_curve", {})
+                layer_safe_sparsity = s24.get(
+                    "safe_domain_sparsity",
+                    self.domain_unnecessary_removal_frac,   # fallback: 5% fixed cap
+                )
+                max_removable = int(n_neurons * layer_safe_sparsity)
+
+                # Study 25: read domain divergence angle — used only for re-ranking, not budget.
+                # Low angle → layer is domain-agnostic → domain-Wanda less reliable → geometry
+                # gets more weight in the combined ranking below.
+                div_angle = (
+                    s25_agg_dom_div[lp.layer_idx]
+                    if lp.layer_idx < len(s25_agg_dom_div) else None
+                )
+
                 sorted_scores, sorted_indices = domain_scores.sort()
-                bottom_k_indices = sorted_indices[:int(n_neurons * 0.20)].tolist()
+
+                # Study 25: adaptive candidate pool — model-relative, always expands.
+                # The pool determines WHICH neurons are candidates; actual removal count
+                # is capped by max_removable (Study 24 budget). Pool must never be smaller
+                # than the budget or the pool itself becomes the bottleneck.
+                #
+                # base_pool = 1.5× the Study 24 budget, floored at 25%.
+                # Expansion: if this layer's concentration is below the model average,
+                # importance is more concentrated (few neurons dominate) → safe to expand
+                # the pool further. Pool never shrinks below base_pool.
+                _s25_dom = ld.get("study25_write_vector_geometry", {})
+                geom_conc = _s25_dom.get("geom_importance_concentration", None)
+                base_pool = max(layer_safe_sparsity * 1.5, 0.25)
+                if geom_conc is not None and s25_avg_geom_conc > 0:
+                    relative_deficit = max(0.0, s25_avg_geom_conc - geom_conc) / s25_avg_geom_conc
+                    candidate_frac = min(1.0, base_pool + 0.10 * relative_deficit)
+                else:
+                    candidate_frac = base_pool
+                bottom_k_indices = sorted_indices[:int(n_neurons * candidate_frac)].tolist()
+
+                # Study 25: domain geometric importance — re-rank removal candidates
+                # by combined Wanda+Geom score so neurons that are doubly unimportant
+                # (low input-side Wanda AND low output-side geometric contribution)
+                # rise to the top of the removal list. Neurons with low Wanda but
+                # non-trivial geometric importance are de-prioritised.
+                s25_dom_key = f"study25_domain_{self.target_domain}"
+                dom_geom_rel = ld.get(s25_dom_key, {}).get("geom_importance_path")
+                dom_geom_scores = None
+                if dom_geom_rel:
+                    dom_geom_full = (
+                        os.path.join(output_dir, dom_geom_rel)
+                        if output_dir else dom_geom_rel
+                    )
+                    if os.path.exists(dom_geom_full):
+                        try:
+                            import torch as _torch_s25
+                            dom_geom_scores = _torch_s25.load(
+                                dom_geom_full, weights_only=True).float()
+                        except Exception:
+                            pass
+
+                if dom_geom_scores is not None and dom_geom_scores.shape[0] == n_neurons:
+                    # Study 25 Add 3: direction_coherence → weight the geometry signal.
+                    # Rank-based combination (avoids scale sensitivity between metrics):
+                    #   wanda_rank[j] = ascending position in domain-Wanda sort
+                    #   geom_rank[j]  = ascending position in domain-geom sort
+                    #   combined[j]   = wanda_rank + geom_weight * geom_rank
+                    #
+                    # geom_weight combines two model-relative signals:
+                    #   coherence: high → write vectors aligned → geometry reliable → weight up
+                    #   div_angle: low → layer domain-agnostic → domain-Wanda unreliable → weight up
+                    # Both signals push geometry weight higher when Wanda is less trustworthy.
+                    # Range: [0.5 × 1.0, 1.5 × 1.5] = [0.5, 2.25]
+                    coherence = _s25_dom.get("direction_coherence", 0.5)
+                    div_factor = min(div_angle / 90.0, 1.0) if div_angle is not None else 0.5
+                    geom_weight = (0.5 + coherence) * (1.0 + (1.0 - div_factor) * 0.5)
+
+                    wanda_ranks = {int(idx): r
+                                   for r, idx in enumerate(sorted_indices.tolist())}
+                    geom_sorted = dom_geom_scores.argsort()  # ascending
+                    geom_ranks = {int(idx): r
+                                  for r, idx in enumerate(geom_sorted.tolist())}
+                    bottom_k_indices = sorted(
+                        bottom_k_indices,
+                        key=lambda idx: (wanda_ranks.get(idx, n_neurons)
+                                         + geom_weight * geom_ranks.get(idx, n_neurons)),
+                    )
+                    logger.debug(
+                        f"    Layer {lp.layer_idx}: Wanda+Geom re-ranking "
+                        f"(coherence={coherence:.3f}, div_angle={div_angle}, "
+                        f"geom_weight={geom_weight:.2f}, pool={candidate_frac:.2f}, "
+                        f"{len(bottom_k_indices)} candidates)"
+                    )
 
                 if global_scores is not None:
                     global_median = global_scores.median().item()
@@ -919,7 +1094,7 @@ class MRIDiagnostician:
                         if idx not in lp.protected_neuron_indices
                     ]
 
-                # Cap at domain_unnecessary_removal_frac
+                # Cap at per-layer safe sparsity (from Study 24) or fixed fallback
                 unnecessary = unnecessary[:max_removable]
 
                 if unnecessary:

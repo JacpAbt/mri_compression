@@ -8,17 +8,47 @@ Single entry point that chains:
   3. Compression: Apply the prescription to the model
   4. Evaluation: Measure compressed model quality
 
-Usage:
-    # MRI only
-    python pipeline.py --model Qwen/Qwen2.5-3B --studies 1,3,4,5,6,8,9,10 --output ./results
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRESET MODES  (recommended — no need to memorise study numbers)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    # Full pipeline: MRI + Compression
-    python pipeline.py --model Qwen/Qwen2.5-3B --studies 1,3,4,5,6,8,9,10,11 \
-        --compress --enable-attn --output ./results --save-model
+  general          – General MRI scan (studies 1,3,4,5,6,8,9,10,15,16,17,18,20)
+                     No compression. Good first look at any model.
 
-    # Compression from existing MRI results
-    python pipeline.py --model Qwen/Qwen2.5-3B --from-summary ./results/summary.json \
-        --compress --save-model
+  compress         – General-purpose compression (same studies + compress stage)
+                     Produces a smaller model preserving general capability.
+
+  domain_scan      – Domain analysis: which neurons serve the target domain?
+                     Requires --domain.  Studies: 1,5,11,22,24.
+
+  domain_compress  – Domain-specialized compression (requires --domain)
+                     Aggressively removes neurons irrelevant to the domain.
+                     Studies: 1,3,4,5,6,8,9,10,11,22,24 + compress stage.
+
+  full_scan        – All MRI studies (no compression). Research / exploration.
+
+Examples:
+  # General compression
+  python -m mri_compressor.pipeline --model Qwen/Qwen3.5-0.8B-Base --mode compress
+
+  # Biomedical specialisation
+  python -m mri_compressor.pipeline --model Qwen/Qwen3.5-0.8B-Base \\
+      --mode domain_compress --domain biomedical --save-model
+
+  # Custom domain from a text file
+  python -m mri_compressor.pipeline --model Qwen/Qwen3.5-0.8B-Base \\
+      --mode domain_compress --domain cybersecurity \\
+      --domain-dataset /path/to/cybersecurity.txt --save-model
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MANUAL MODE  (advanced — specify studies yourself)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  python -m mri_compressor.pipeline --model gpt2 --studies 1,5,10
+  python -m mri_compressor.pipeline --model Qwen/Qwen2.5-3B \\
+      --studies 1,3,4,5,6,8,9,10,11 --compress
+  python -m mri_compressor.pipeline --model Qwen/Qwen2.5-3B \\
+      --from-summary ./results/summary.json --compress
 """
 
 import argparse
@@ -31,6 +61,131 @@ from pathlib import Path
 from .config import ExperimentConfig
 from .model_utils import ModelInspector
 from .data_utils import load_wikitext_data, get_dataloader, evaluate_perplexity
+
+
+# ---------------------------------------------------------------------------
+# Preset modes — study lists and defaults
+# ---------------------------------------------------------------------------
+
+# Built-in domain names that have their own data loaders (no path required).
+_BUILTIN_DOMAINS = {"biomedical"}
+
+# Studies that are always meaningful regardless of model/domain.
+_CORE_STUDIES         = [1, 3, 4, 5, 6, 8, 9, 10]
+_EXTENDED_STUDIES     = [15, 16, 17, 18, 20, 25]       # geometry / rank / cascade / write-vector
+_DOMAIN_STUDIES       = [11, 22, 24, 25]               # need domain data (25 adds domain divergence)
+_STRUCTURAL_STUDIES   = [12, 13, 14, 19, 21, 23]       # advanced / hybrid
+
+PRESET_MODES = {
+    "general": {
+        "description": (
+            "General MRI scan — identify compression opportunities "
+            "without domain specialisation"
+        ),
+        "studies": _CORE_STUDIES + _EXTENDED_STUDIES,
+        "compress": False,
+        "requires_domain": False,
+    },
+    "compress": {
+        "description": (
+            "General-purpose MRI + compression — produces a smaller model "
+            "that preserves general capability"
+        ),
+        "studies": _CORE_STUDIES + _EXTENDED_STUDIES,
+        "compress": True,
+        "enable_attn": True,
+        "requires_domain": False,
+    },
+    "domain_scan": {
+        "description": (
+            "Domain-specific analysis — map which neurons serve a target domain, "
+            "find safe per-layer pruning levels (requires --domain)"
+        ),
+        "studies": [1, 5, 11, 22, 24, 25],
+        "compress": False,
+        "requires_domain": True,
+    },
+    "domain_compress": {
+        "description": (
+            "Domain-specialised compression — aggressively removes neurons "
+            "irrelevant to the target domain (requires --domain)"
+        ),
+        "studies": _CORE_STUDIES + _DOMAIN_STUDIES,
+        "compress": True,
+        "enable_attn": True,
+        "requires_domain": True,
+    },
+    "full_scan": {
+        "description": (
+            "All MRI studies — comprehensive research scan, no compression"
+        ),
+        "studies": (
+            _CORE_STUDIES
+            + _EXTENDED_STUDIES
+            + _STRUCTURAL_STUDIES
+            + [2, 7, 11, 22]   # 24 added dynamically when --domain is given
+        ),
+        "compress": False,
+        "requires_domain": False,
+    },
+}
+
+
+def apply_preset_mode(args) -> None:
+    """
+    Expand a preset mode into concrete study list and flag defaults.
+    Called before ExperimentConfig is built so the expanded values are
+    available via `args.*`.
+
+    If ``args.mode`` is None (legacy / manual mode), nothing is changed.
+    """
+    if args.mode is None:
+        return
+
+    mode = PRESET_MODES.get(args.mode)
+    if mode is None:
+        known = ", ".join(PRESET_MODES)
+        raise SystemExit(
+            f"Unknown --mode '{args.mode}'.  Known modes: {known}"
+        )
+
+    if mode.get("requires_domain") and not args.domain:
+        raise SystemExit(
+            f"--mode {args.mode} requires --domain <name>.  "
+            f"Built-in choices: {', '.join(sorted(_BUILTIN_DOMAINS))}.  "
+            f"Or supply any name with --domain-dataset."
+        )
+
+    # Expand study list — merge with any explicit --studies override
+    if not args.studies:
+        studies = list(mode["studies"])
+        # full_scan: add Study 24 automatically when a domain is provided
+        if args.mode == "full_scan" and args.domain:
+            studies.append(24)
+        args.studies = ",".join(str(s) for s in sorted(set(studies)))
+    else:
+        print(
+            f"  [mode={args.mode}] --studies override is present; "
+            f"using supplied study list instead of preset defaults."
+        )
+
+    # Set compression flag
+    if mode.get("compress") and not args.compress:
+        args.compress = True
+
+    # Set attention pruning flag
+    if mode.get("enable_attn") and not args.enable_attn:
+        args.enable_attn = True
+
+    # Wire --domain into the target_domain / custom_domain_name fields
+    if args.domain:
+        if not args.target_domain:
+            args.target_domain = args.domain
+        if not args.custom_domain_name:
+            args.custom_domain_name = args.domain
+        # If there's an explicit dataset path, wire it in
+        if args.domain_dataset and not args.custom_domain_path:
+            args.custom_domain_path = args.domain_dataset
 
 
 def run_mri_stage(config: ExperimentConfig, inspector: ModelInspector, studies: list[int]) -> dict:
@@ -133,7 +288,19 @@ def _create_domain_dataloader(
     """Create a dataloader from domain-specific data for reconstruction."""
     from .data_utils import TextDataset
 
-    # If the target is a custom domain with a path, load from that
+    # ---- Built-in custom domains (have their own loaders, no path required) ----
+    if domain_name in _BUILTIN_DOMAINS:
+        try:
+            if domain_name == "biomedical":
+                from .mri.studies_domain_compression import load_biomedical_dataset
+                dataset = load_biomedical_dataset(
+                    tokenizer, max_seq_len=max_seq_len, n_samples=128)
+                return get_dataloader(dataset, batch_size=batch_size)
+        except Exception as e:
+            print(f"  Warning: Failed to load built-in domain '{domain_name}': {e}")
+            return None
+
+    # ---- Custom domain with explicit path ----
     if custom_path and custom_name and custom_name == domain_name:
         try:
             if os.path.isfile(custom_path):
@@ -144,7 +311,10 @@ def _create_domain_dataloader(
                 ds = load_dataset(custom_path, split="train", trust_remote_code=True)
                 for field_name in ["text", "content", "question", "prompt"]:
                     if field_name in ds.column_names:
-                        text = "\n".join(str(row[field_name]) for row in ds if len(str(row[field_name])) > 50)
+                        text = "\n".join(
+                            str(row[field_name]) for row in ds
+                            if len(str(row[field_name])) > 50
+                        )
                         break
                 else:
                     return None
@@ -160,7 +330,7 @@ def _create_domain_dataloader(
             print(f"  Warning: Failed to load custom domain data: {e}")
             return None
 
-    # Standard domain: load via the study domain system
+    # ---- Standard built-in domains (english / math / code / italian) ----
     try:
         from .mri.studies_domain import load_domain_datasets
         domain_datasets = load_domain_datasets(
@@ -169,8 +339,11 @@ def _create_domain_dataloader(
         if domain_name in domain_datasets:
             return get_dataloader(domain_datasets[domain_name], batch_size=batch_size)
         else:
-            print(f"  Warning: Domain '{domain_name}' not found in standard domains "
-                  f"({list(domain_datasets.keys())})")
+            print(
+                f"  Warning: Domain '{domain_name}' not found in standard domains "
+                f"({list(domain_datasets.keys())}).  "
+                f"Use --domain-dataset to provide custom text."
+            )
             return None
     except Exception as e:
         print(f"  Warning: Failed to load domain datasets: {e}")
@@ -181,6 +354,7 @@ def run_evaluation_stage(
     inspector: ModelInspector,
     config: ExperimentConfig,
     baseline_ppl: float,
+    domain_baseline_ppl=None,
 ) -> dict:
     """Stage 4: Evaluate compressed model."""
     print("\n" + "=" * 80)
@@ -202,12 +376,45 @@ def run_evaluation_stage(
     ppl_increase = compressed_ppl - baseline_ppl
     ppl_increase_pct = (ppl_increase / baseline_ppl) * 100
 
-    print(f"\n  Baseline PPL:    {baseline_ppl:.2f}")
-    print(f"  Compressed PPL:  {compressed_ppl:.2f}")
-    print(f"  PPL increase:    {ppl_increase:.2f} ({ppl_increase_pct:+.1f}%)")
-
     # Count parameters
     total_params = sum(p.numel() for p in inspector.model.parameters())
+
+    # ---- Domain PPL (primary metric for domain_compress mode) ----
+    domain_compressed_ppl = None
+    if config.target_domain:
+        print(f"\n  Loading {config.target_domain} domain dataset for evaluation...")
+        domain_loader = _create_domain_dataloader(
+            config.target_domain, inspector.tokenizer,
+            max_seq_len=config.max_length, batch_size=config.batch_size,
+            custom_path=config.custom_domain_path,
+            custom_name=config.custom_domain_name,
+        )
+        if domain_loader is not None:
+            domain_compressed_ppl = evaluate_perplexity(
+                inspector.model, domain_loader, inspector.device,
+                max_batches=8,
+            )
+
+    # ---- Print ----
+    if config.target_domain and domain_compressed_ppl is not None:
+        # Domain mode: domain PPL is the headline; wikitext shown as tradeoff reference
+        if domain_baseline_ppl is not None:
+            dom_delta = domain_compressed_ppl - domain_baseline_ppl
+            dom_delta_pct = (dom_delta / domain_baseline_ppl) * 100
+            print(f"\n  Domain ({config.target_domain}) PPL:  "
+                  f"{domain_baseline_ppl:.2f} → {domain_compressed_ppl:.2f}"
+                  f"  ({dom_delta_pct:+.1f}%)")
+        else:
+            print(f"\n  Domain ({config.target_domain}) PPL (compressed):  {domain_compressed_ppl:.2f}")
+        print(f"  Generic PPL (wikitext):  {baseline_ppl:.2f} → {compressed_ppl:.2f}"
+              f"  ({ppl_increase_pct:+.1f}%)")
+        print(f"  (Generic PPL increase is expected — neurons irrelevant to"
+              f" {config.target_domain} were removed)")
+    else:
+        print(f"\n  Baseline PPL:    {baseline_ppl:.2f}")
+        print(f"  Compressed PPL:  {compressed_ppl:.2f}")
+        print(f"  PPL increase:    {ppl_increase:.2f} ({ppl_increase_pct:+.1f}%)")
+
     print(f"  Total parameters: {total_params:,}")
 
     eval_report = {
@@ -217,6 +424,10 @@ def run_evaluation_stage(
         "ppl_increase_pct": ppl_increase_pct,
         "total_parameters": total_params,
     }
+    if config.target_domain and domain_compressed_ppl is not None:
+        eval_report["domain"] = config.target_domain
+        eval_report["domain_baseline_ppl"] = domain_baseline_ppl
+        eval_report["domain_compressed_ppl"] = domain_compressed_ppl
 
     # Save evaluation report
     report_path = os.path.join(config.output_dir, "evaluation_report.json")
@@ -231,9 +442,19 @@ def run_pipeline(args):
     """Run the full or partial pipeline."""
     t_start = time.time()
 
+    # ---- Expand preset mode into concrete args FIRST ----
+    apply_preset_mode(args)
+
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Print what we're about to do
+    if args.mode:
+        mode_desc = PRESET_MODES[args.mode]["description"]
+        print(f"\n  Mode: {args.mode}  —  {mode_desc}")
+        if getattr(args, "domain", None):
+            print(f"  Domain: {args.domain}")
 
     config = ExperimentConfig(
         model_name=args.model,
@@ -251,11 +472,11 @@ def run_pipeline(args):
         reconstruction_steps=args.reconstruction_steps,
         reconstruction_lr=args.reconstruction_lr,
         save_compressed_model=args.save_model,
-        target_domain=args.target_domain,
-        custom_domain_path=getattr(args, 'custom_domain_path', None),
-        custom_domain_name=getattr(args, 'custom_domain_name', None),
-        domain_unnecessary_frac=getattr(args, 'domain_unnecessary_frac', 0.05),
-        domain_critical_frac=getattr(args, 'domain_critical_frac', 0.10),
+        target_domain=getattr(args, "target_domain", None),
+        custom_domain_path=getattr(args, "custom_domain_path", None),
+        custom_domain_name=getattr(args, "custom_domain_name", None),
+        domain_unnecessary_frac=getattr(args, "domain_unnecessary_frac", 0.05),
+        domain_critical_frac=getattr(args, "domain_critical_frac", 0.10),
         enable_low_rank=not args.disable_low_rank,
         enable_static_fold=not args.disable_static_fold,
         enable_weight_sharing=args.enable_weight_sharing,
@@ -282,14 +503,23 @@ def run_pipeline(args):
         summary_dir = str(Path(args.from_summary).parent)
         summary["output_dir"] = summary_dir
         baseline_ppl = summary.get("baseline_ppl", 0)
+        _s24 = summary.get("aggregated", {}).get("study24", {})
+        domain_baseline_ppl = float(_s24["baseline_ppl"]) if _s24.get("baseline_ppl") else None
     else:
+        if not args.studies:
+            raise SystemExit(
+                "No studies specified.  Use --mode <mode> or --studies <numbers>."
+            )
         # Parse study list
         studies = [int(s.strip()) for s in args.studies.split(",")]
+        print(f"  Studies: {sorted(studies)}")
 
         # Stage 1: MRI
         summary = run_mri_stage(config, inspector, studies)
         summary["output_dir"] = config.output_dir
         baseline_ppl = summary.get("baseline_ppl", 0)
+        _s24 = summary.get("aggregated", {}).get("study24", {})
+        domain_baseline_ppl = float(_s24["baseline_ppl"]) if _s24.get("baseline_ppl") else None
 
     # Stage 2-4: Compression pipeline (if requested)
     if args.compress:
@@ -304,7 +534,8 @@ def run_pipeline(args):
         result = run_compression_stage(inspector, prescription, config, summary)
 
         # Stage 4: Evaluation
-        eval_report = run_evaluation_stage(inspector, config, baseline_ppl)
+        eval_report = run_evaluation_stage(inspector, config, baseline_ppl,
+                                           domain_baseline_ppl=domain_baseline_ppl)
 
         # Save compressed model
         if args.save_model:
@@ -319,41 +550,89 @@ def run_pipeline(args):
 
 
 def main():
+    mode_list = "\n".join(
+        f"    {name:20s}  {info['description']}"
+        for name, info in PRESET_MODES.items()
+    )
+
     parser = argparse.ArgumentParser(
         description="MRI-to-Compression Pipeline for LLMs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # MRI scan only
-  python pipeline.py --model gpt2 --studies 1,5,10
+        epilog=f"""
+AVAILABLE MODES
+{mode_list}
 
-  # Full pipeline
-  python pipeline.py --model Qwen/Qwen2.5-3B --studies 1,3,4,5,6,8,9,10,11 --compress
+EXAMPLES
+  # Biomedical specialisation (auto-downloads PubMed data)
+  python -m mri_compressor.pipeline --model Qwen/Qwen3.5-0.8B-Base \\
+      --mode domain_compress --domain biomedical --save-model
 
-  # Compression from existing MRI
-  python pipeline.py --model Qwen/Qwen2.5-3B --from-summary ./results/summary.json --compress
+  # Custom domain from a local text file
+  python -m mri_compressor.pipeline --model Qwen/Qwen3.5-0.8B-Base \\
+      --mode domain_compress --domain legal --domain-dataset /data/legal.txt
+
+  # General compression
+  python -m mri_compressor.pipeline --model Qwen/Qwen3.5-0.8B-Base --mode compress
+
+  # Manual study list (legacy / advanced)
+  python -m mri_compressor.pipeline --model gpt2 --studies 1,5,10
         """,
     )
 
-    # Model
-    parser.add_argument("--model", type=str, default="gpt2", help="Model name or path")
-    parser.add_argument("--device", type=str, default="auto", help="Device (auto/cuda/cpu)")
+    # ---- Model ----
+    parser.add_argument("--model", type=str, default="gpt2",
+                        help="HuggingFace model name or local path")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device: auto | cuda | cpu")
 
-    # MRI
-    parser.add_argument("--studies", type=str, default="1,3,4,5,6,8,9,10",
-                        help="Comma-separated study numbers to run")
+    # ---- Mode (recommended) ----
+    parser.add_argument(
+        "--mode", type=str, default=None,
+        choices=list(PRESET_MODES),
+        metavar="MODE",
+        help=(
+            "Preset pipeline mode.  Choices: "
+            + ", ".join(PRESET_MODES)
+            + "  (see epilog for descriptions)"
+        ),
+    )
+
+    # ---- Domain (for domain_scan / domain_compress modes) ----
+    parser.add_argument(
+        "--domain", type=str, default=None,
+        metavar="NAME",
+        help=(
+            "Target domain for domain-aware modes.  "
+            "Built-in: biomedical.  "
+            "Standard: english, math, code, italian.  "
+            "Custom: any name combined with --domain-dataset."
+        ),
+    )
+    parser.add_argument(
+        "--domain-dataset", type=str, default=None,
+        dest="domain_dataset",
+        metavar="PATH",
+        help=(
+            "Path to a custom domain text file or HuggingFace dataset id.  "
+            "Used when --domain is not one of the built-in names."
+        ),
+    )
+
+    # ---- MRI (manual / advanced) ----
+    parser.add_argument("--studies", type=str, default=None,
+                        help="Comma-separated study numbers (overrides --mode preset)")
     parser.add_argument("--from-summary", type=str, default=None,
-                        help="Skip MRI, load existing summary.json")
+                        help="Skip MRI, load existing summary.json and go straight to compression")
 
-    # Data
+    # ---- Data ----
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-batches", type=int, default=16)
     parser.add_argument("--max-samples", type=int, default=1000)
     parser.add_argument("--max-length", type=int, default=512)
 
-    # Compression
+    # ---- Compression flags ----
     parser.add_argument("--compress", action="store_true",
-                        help="Run compression after MRI")
+                        help="Run compression after MRI (automatically set by some modes)")
     parser.add_argument("--enable-attn", action="store_true",
                         help="Enable attention head pruning")
     parser.add_argument("--enable-depth", action="store_true",
@@ -361,38 +640,46 @@ Examples:
     parser.add_argument("--disable-merge", action="store_true",
                         help="Disable neuron merging")
     parser.add_argument("--reconstruction-steps", type=int, default=200,
-                        help="Local reconstruction fine-tuning steps per layer")
+                        help="Local reconstruction fine-tuning steps per layer (default: 200)")
     parser.add_argument("--reconstruction-lr", type=float, default=1e-4,
-                        help="Learning rate for local reconstruction")
+                        help="Learning rate for local reconstruction (default: 1e-4)")
+
+    # ---- Domain compression fine-tuning (advanced) ----
     parser.add_argument("--target-domain", type=str, default=None,
-                        help="Target domain for domain-conditional compression "
-                             "(e.g., english, math, code, italian, or a custom name)")
+                        help="Override target domain for compression (set automatically by --domain)")
     parser.add_argument("--custom-domain-path", type=str, default=None,
-                        help="Path to custom domain text file or HuggingFace dataset")
+                        help="Override custom domain path (set automatically by --domain-dataset)")
     parser.add_argument("--custom-domain-name", type=str, default=None,
-                        help="Name for the custom domain (e.g., cybersecurity)")
+                        help="Override custom domain name (set automatically by --domain)")
     parser.add_argument("--domain-unnecessary-frac", type=float, default=0.05,
-                        help="Max fraction of neurons to remove per layer for domain specialization")
+                        help="Fallback fraction of neurons to remove per layer when Study 24 is "
+                             "unavailable (default: 0.05 = 5%%)")
     parser.add_argument("--domain-critical-frac", type=float, default=0.10,
-                        help="Fraction of top domain-critical neurons to protect per layer")
-    parser.add_argument("--enable-low-rank", action="store_true", default=True,
-                        help="Enable low-rank factorization (default: on)")
+                        help="Fraction of top domain-critical neurons to protect per layer "
+                             "(default: 0.10 = 10%%)")
+
+    # ---- Module toggles ----
     parser.add_argument("--disable-low-rank", action="store_true",
-                        help="Disable low-rank factorization")
-    parser.add_argument("--enable-static-fold", action="store_true", default=True,
-                        help="Enable static neuron folding (default: on)")
+                        help="Disable low-rank MLP factorization")
     parser.add_argument("--disable-static-fold", action="store_true",
                         help="Disable static neuron folding")
     parser.add_argument("--enable-weight-sharing", action="store_true",
                         help="Enable weight sharing between similar layers (experimental)")
 
-    # Output
+    # ---- Output ----
     parser.add_argument("--output", type=str, default="./results",
-                        help="Output directory")
+                        help="Output directory (default: ./results)")
     parser.add_argument("--save-model", action="store_true",
-                        help="Save the compressed model")
+                        help="Save the compressed model to <output>/compressed_model/")
 
     args = parser.parse_args()
+
+    # Validate: need either --mode or --studies or --from-summary
+    if args.mode is None and args.studies is None and args.from_summary is None:
+        parser.error(
+            "Specify at least one of: --mode <mode>, --studies <list>, or --from-summary <path>"
+        )
+
     run_pipeline(args)
 
 

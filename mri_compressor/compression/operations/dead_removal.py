@@ -25,6 +25,7 @@ class DeadNeuronRemover:
         n_to_remove,
         device,
         protected_indices: Optional[set] = None,
+        mlp_info=None,
     ):
         """
         Remove the lowest-magnitude neurons from an MLP layer.
@@ -63,7 +64,7 @@ class DeadNeuronRemover:
         else:
             keep_mask[sorted_idx[:n_to_remove]] = False
 
-        n_removed = DeadNeuronRemover._shrink_mlp(layer, keep_mask, device)
+        n_removed = DeadNeuronRemover._shrink_mlp(layer, keep_mask, device, mlp_info)
         return n_removed, activations[:, keep_mask]
 
     @staticmethod
@@ -74,6 +75,7 @@ class DeadNeuronRemover:
         indices_to_remove: list,
         device,
         protected_indices: Optional[set] = None,
+        mlp_info=None,
     ):
         """
         Remove specific neurons by index (not magnitude ranking).
@@ -105,7 +107,7 @@ class DeadNeuronRemover:
             if 0 <= idx < n_neurons and idx not in protected:
                 keep_mask[idx] = False
 
-        n_removed = DeadNeuronRemover._shrink_mlp(layer, keep_mask, device)
+        n_removed = DeadNeuronRemover._shrink_mlp(layer, keep_mask, device, mlp_info)
         return n_removed, activations[:, keep_mask]
 
     @staticmethod
@@ -117,6 +119,7 @@ class DeadNeuronRemover:
         domain_unnecessary_indices: list,
         device,
         protected_indices: Optional[set] = None,
+        mlp_info=None,
     ):
         """
         Combined dead-removal + domain-unnecessary removal in a single pass.
@@ -162,26 +165,63 @@ class DeadNeuronRemover:
                 domain_removed += 1
 
         # Single shrink operation
-        total_removed = DeadNeuronRemover._shrink_mlp(layer, keep_mask, device)
+        total_removed = DeadNeuronRemover._shrink_mlp(layer, keep_mask, device, mlp_info)
         return dead_removed, domain_removed, activations[:, keep_mask]
 
     @staticmethod
     @torch.no_grad()
-    def _shrink_mlp(layer, keep_mask, device):
-        mlp_modules = get_mlp_modules(layer)
+    def _shrink_mlp(layer, keep_mask, device, mlp_info=None):
         n_removed = (~keep_mask).sum().item()
         if n_removed == 0:
             return 0
         keep_idx = keep_mask.nonzero(as_tuple=True)[0].to(device)
-        for name in ["gate_proj", "up_proj"]:
-            if name in mlp_modules:
-                mod = mlp_modules[name]
-                mod.weight = nn.Parameter(torch.index_select(mod.weight.data, 0, keep_idx))
-                mod.out_features = mod.weight.shape[0]
-                if mod.bias is not None:
-                    mod.bias = nn.Parameter(mod.bias.data[keep_idx])
-        if "down_proj" in mlp_modules:
-            mod = mlp_modules["down_proj"]
-            mod.weight = nn.Parameter(torch.index_select(mod.weight.data, 1, keep_idx))
-            mod.in_features = mod.weight.shape[1]
+
+        if mlp_info is not None:
+            inter = mlp_info.intermediate_size
+            # gate_proj / up_proj — neurons are the "output" (intermediate) dimension
+            for proj in filter(None, [mlp_info.gate_proj, mlp_info.up_proj]):
+                W = proj.weight
+                if W.shape[0] == inter:
+                    # nn.Linear layout: (inter, hidden) — neurons are rows
+                    proj.weight = nn.Parameter(
+                        torch.index_select(W, 0, keep_idx))
+                    proj.out_features = proj.weight.shape[0]
+                else:
+                    # Conv1D layout: (hidden, inter) — neurons are columns
+                    proj.weight = nn.Parameter(
+                        torch.index_select(W, 1, keep_idx))
+                    if hasattr(proj, 'nf'):
+                        proj.nf = proj.weight.shape[1]
+                if proj.bias is not None and proj.bias.shape[0] == inter:
+                    proj.bias = nn.Parameter(proj.bias.data[keep_idx])
+            # down_proj / c_proj — neurons are the "input" (intermediate) dimension
+            if mlp_info.down_proj is not None:
+                proj = mlp_info.down_proj
+                W = proj.weight
+                if W.shape[0] == inter:
+                    # Conv1D layout: (inter, hidden) — neurons are rows
+                    proj.weight = nn.Parameter(
+                        torch.index_select(W, 0, keep_idx))
+                else:
+                    # nn.Linear layout: (hidden, inter) — neurons are columns
+                    proj.weight = nn.Parameter(
+                        torch.index_select(W, 1, keep_idx))
+                    proj.in_features = proj.weight.shape[1]
+        else:
+            # Fallback: nn.Linear only (original behaviour)
+            mlp_modules = get_mlp_modules(layer)
+            for name in ["gate_proj", "up_proj"]:
+                if name in mlp_modules:
+                    mod = mlp_modules[name]
+                    mod.weight = nn.Parameter(
+                        torch.index_select(mod.weight.data, 0, keep_idx))
+                    mod.out_features = mod.weight.shape[0]
+                    if mod.bias is not None:
+                        mod.bias = nn.Parameter(mod.bias.data[keep_idx])
+            if "down_proj" in mlp_modules:
+                mod = mlp_modules["down_proj"]
+                mod.weight = nn.Parameter(
+                    torch.index_select(mod.weight.data, 1, keep_idx))
+                mod.in_features = mod.weight.shape[1]
+
         return n_removed

@@ -630,6 +630,120 @@ def build_summary(
                 ),
             }
 
+    # ---- Study 24: Domain Compression Curve ----
+    if "domain_compression_curve" in results:
+        curve = results["domain_compression_curve"]
+        reports = curve.get("reports", [])
+        for r in reports:
+            layer_key = str(r.layer_idx)
+            if layer_key not in summary["per_layer"]:
+                summary["per_layer"][layer_key] = {}
+            summary["per_layer"][layer_key]["study24_domain_compression_curve"] = {
+                "safe_domain_sparsity": r.safe_domain_sparsity,
+                "n_neurons": r.n_neurons,
+                "domain_baseline_ppl": r.domain_baseline_ppl,
+                "sparsity_levels": r.sparsity_levels,
+                "domain_ppl_curve": [float(p) for p in r.domain_ppl_curve],
+                "elbow_ppl_delta": r.elbow_ppl_delta,
+            }
+        if reports:
+            s24_agg = {
+                "domain_name": curve.get("domain_name", "unknown"),
+                "baseline_ppl": float(curve.get("baseline_ppl", 0.0)),
+                "avg_safe_sparsity": float(curve.get("avg_safe_sparsity", 0.0)),
+                "sparsity_levels": curve.get("sparsity_levels", []),
+                "n_layers_scanned": len(reports),
+                "n_layers_no_safe_pruning": sum(
+                    1 for r in reports if r.safe_domain_sparsity == 0.0
+                ),
+            }
+            gc = curve.get("global_curve")
+            if gc is not None:
+                s24_agg["global_curve"] = {
+                    "sparsity_levels": gc.sparsity_levels,
+                    "global_ppl_curve": [float(p) for p in gc.global_ppl_curve],
+                    "safe_global_sparsity": float(gc.safe_global_sparsity),
+                    "elbow_ppl_delta": float(gc.elbow_ppl_delta),
+                }
+            summary["aggregated"]["study24"] = s24_agg
+
+    # ---- Study 25: Write-Vector Geometry ----
+    if "write_vector_geometry" in results:
+        geo = results["write_vector_geometry"]
+        layer_reports = geo.get("layer_reports", [])
+        domain_divergences = geo.get("domain_divergences", {})
+
+        for report in layer_reports:
+            lk = str(report.layer_idx)
+            if lk not in summary["per_layer"]:
+                summary["per_layer"][lk] = {}
+
+            # Save large tensors to .pt files in the tensor directory
+            geom_imp_path = None
+            dom_dir_path  = None
+
+            if report.geometric_importance is not None and report.geometric_importance.numel() > 0:
+                fn = f"study25_geom_importance_layer{report.layer_idx}.pt"
+                p  = os.path.join(tensor_dir, fn)
+                torch.save(report.geometric_importance.cpu(), p)
+                geom_imp_path = f"summary_tensors/{fn}"
+
+            if report.dominant_direction is not None and report.dominant_direction.numel() > 0:
+                fn = f"study25_dominant_dir_layer{report.layer_idx}.pt"
+                p  = os.path.join(tensor_dir, fn)
+                torch.save(report.dominant_direction.cpu(), p)
+                dom_dir_path = f"summary_tensors/{fn}"
+
+            summary["per_layer"][lk]["study25_write_vector_geometry"] = {
+                "domain_name":                   report.domain_name,
+                "n_vectors_used":                report.n_vectors_used,
+                "mean_write_length":             report.mean_write_length,
+                "write_length_cv":               report.write_length_cv,
+                "direction_coherence":           report.direction_coherence,
+                "intrinsic_dim_95":              report.intrinsic_dim_95,
+                "geom_importance_concentration": report.geom_importance_concentration,
+                "geom_importance_path":          geom_imp_path,
+                "dominant_direction_path":       dom_dir_path,
+            }
+
+        # Aggregate cross-domain divergences at the study level
+        if domain_divergences:
+            summary["aggregated"]["study25"] = {
+                "domain_direction_divergences": domain_divergences,
+                "avg_direction_coherence": (
+                    sum(r.direction_coherence for r in layer_reports) / len(layer_reports)
+                    if layer_reports else 0.0
+                ),
+                "avg_intrinsic_dim_95": (
+                    sum(r.intrinsic_dim_95 for r in layer_reports) / len(layer_reports)
+                    if layer_reports else 0
+                ),
+            }
+
+        # ---- Study 25: domain-pass geometric importance (per domain, per layer) ----
+        # Serialise the domain geometric importance tensors so the diagnostician
+        # can use them for combined Wanda+Geom ranking during domain compression.
+        domain_reports_25 = geo.get("domain_reports", {})
+        for dom_name, d_reps in domain_reports_25.items():
+            for d_rep in d_reps:
+                lk = str(d_rep.layer_idx)
+                if lk not in summary["per_layer"]:
+                    continue
+                if (d_rep.geometric_importance is None
+                        or d_rep.geometric_importance.numel() == 0):
+                    continue
+                geom_fname = (
+                    f"study25_domain_{dom_name}_geom_importance"
+                    f"_layer{d_rep.layer_idx}.pt"
+                )
+                geom_full = os.path.join(tensor_dir, geom_fname)
+                torch.save(d_rep.geometric_importance.cpu(), geom_full)
+                geom_rel = f"summary_tensors/{geom_fname}"
+                dom_key = f"study25_domain_{dom_name}"
+                if dom_key not in summary["per_layer"][lk]:
+                    summary["per_layer"][lk][dom_key] = {}
+                summary["per_layer"][lk][dom_key]["geom_importance_path"] = geom_rel
+
     # ---- Build compression hints from study data ----
     for layer_key, layer_data in summary["per_layer"].items():
         hints = {}

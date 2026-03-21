@@ -80,17 +80,23 @@ def collect_activations(
     final tensor back to the target device for fast downstream operations.
     """
     all_acts = []
-    layer = resolve_layer(model, layer_idx, inspector)
-    mlp_mods = get_mlp_modules(layer)
-    down_proj = mlp_mods.get("down_proj") or mlp_mods.get("fc2") or mlp_mods.get("c_proj")
-    if down_proj is None:
-        # last fallback: use the last Linear child of the mlp
-        for _, m in list(get_mlp_submodule(layer).named_modules())[::-1]:
-            if isinstance(m, nn.Linear):
-                down_proj = m
-                break
-    if down_proj is None:
-        raise RuntimeError(f"Cannot find down projection for layer {layer_idx}")
+    if inspector is not None and layer_idx < len(inspector.mlp_layers):
+        # Primary path: inspector already resolved the correct module for every
+        # architecture, including GPT-2's Conv1D (c_proj) which isinstance(nn.Linear)
+        # checks would miss.
+        down_proj = inspector.mlp_layers[layer_idx].down_proj
+    else:
+        layer = resolve_layer(model, layer_idx, inspector)
+        mlp_mods = get_mlp_modules(layer)
+        down_proj = mlp_mods.get("down_proj") or mlp_mods.get("fc2") or mlp_mods.get("c_proj")
+        if down_proj is None:
+            # last fallback: use the last Linear child of the mlp
+            for _, m in list(get_mlp_submodule(layer).named_modules())[::-1]:
+                if isinstance(m, nn.Linear):
+                    down_proj = m
+                    break
+        if down_proj is None:
+            raise RuntimeError(f"Cannot find down projection for layer {layer_idx}")
 
     hook_data = {"acts": None}
 
@@ -445,7 +451,8 @@ class MRICompressor:
 
                 with timer(f"Low-rank factorization for layer {lp.layer_idx}"):
                     ranks = LowRankFactorizer.factorize_mlp(
-                        layer, lp.low_rank_target, self.device)
+                        layer, lp.low_rank_target, self.device,
+                        per_proj_ranks=lp.low_rank_ranks)
                 if ranks:
                     lr["low_rank_applied"] = 1
                     is_lossy_lt = True
@@ -515,7 +522,8 @@ class MRICompressor:
                 # Remove domain-unnecessary neurons by index
                 n_rm, activations = DeadNeuronRemover.remove_by_indices(
                     layer, activations, lp.domain_unnecessary_indices,
-                    self.device, protected_indices=lp.protected_neuron_indices)
+                    self.device, protected_indices=lp.protected_neuron_indices,
+                    mlp_info=self.inspector.mlp_layers[lp.layer_idx] if self.inspector else None)
                 lr["domain_unnecessary_removed"] = n_rm
                 logger.info(f"    Removed {n_rm} domain-unnecessary neurons "
                             f"(target domain: {lp.target_domain})")
@@ -564,7 +572,8 @@ class MRICompressor:
             if lp.low_rank_target is not None and self.enable_low_rank:
                 with timer(f"Low-rank factorization for layer {lp.layer_idx}"):
                     ranks = LowRankFactorizer.factorize_mlp(
-                        layer, lp.low_rank_target, self.device)
+                        layer, lp.low_rank_target, self.device,
+                        per_proj_ranks=lp.low_rank_ranks)
                 if ranks:
                     lr["low_rank_applied"] = 1
 
@@ -618,6 +627,7 @@ class MRICompressor:
                 has_domain_removal = (lp.domain_unnecessary_indices
                                       and len(lp.domain_unnecessary_indices) > 0)
 
+                _mlp_info = self.inspector.mlp_layers[lp.layer_idx] if self.inspector else None
                 if has_domain_removal and lp.dead_neuron_count > 0:
                     # Combined single-pass removal to avoid index drift
                     n_dead, n_domain, activations = DeadNeuronRemover.remove_combined(
@@ -625,7 +635,8 @@ class MRICompressor:
                         n_dead_to_remove=lp.dead_neuron_count,
                         domain_unnecessary_indices=lp.domain_unnecessary_indices,
                         device=self.device,
-                        protected_indices=lp.protected_neuron_indices)
+                        protected_indices=lp.protected_neuron_indices,
+                        mlp_info=_mlp_info)
                     lr["dead_removed"] = n_dead
                     lr["domain_unnecessary_removed"] = n_domain
                     logger.info(f"    Combined removal: {n_dead} dead + "
@@ -635,7 +646,8 @@ class MRICompressor:
                     if lp.dead_neuron_count > 0:
                         n_rm, activations = DeadNeuronRemover.remove_by_mri_count(
                             layer, activations, lp.dead_neuron_count, self.device,
-                            protected_indices=lp.protected_neuron_indices)
+                            protected_indices=lp.protected_neuron_indices,
+                            mlp_info=_mlp_info)
                         lr["dead_removed"] = n_rm
                         logger.info(f"    Removed {n_rm} dead neurons")
 
@@ -643,7 +655,8 @@ class MRICompressor:
                 if lp.dormant_neuron_count > 0:
                     n_rm, activations = DeadNeuronRemover.remove_by_mri_count(
                         layer, activations, lp.dormant_neuron_count, self.device,
-                        protected_indices=lp.protected_neuron_indices)
+                        protected_indices=lp.protected_neuron_indices,
+                        mlp_info=_mlp_info)
                     lr["dormant_removed"] = n_rm
                     logger.info(f"    Removed {n_rm} dormant neurons")
 
@@ -672,7 +685,8 @@ class MRICompressor:
                 if total_to_remove > 0:
                     n_rm, activations = DeadNeuronRemover.remove_by_mri_count(
                         layer, activations, total_to_remove, self.device,
-                        protected_indices=lp.protected_neuron_indices)
+                        protected_indices=lp.protected_neuron_indices,
+                        mlp_info=self.inspector.mlp_layers[lp.layer_idx] if self.inspector else None)
                     lr["dead_removed"] = min(n_rm, lp.dead_neuron_count)
                     lr["dormant_removed"] = max(0, n_rm - lp.dead_neuron_count)
                     logger.info(f"    Removed {n_rm} neurons (dead+dormant)")
@@ -730,7 +744,8 @@ class MRICompressor:
         if lp.low_rank_target is not None and self.enable_low_rank:
             with timer(f"Low-rank factorization for layer {lp.layer_idx}"):
                 ranks = LowRankFactorizer.factorize_mlp(
-                    layer, lp.low_rank_target, self.device)
+                    layer, lp.low_rank_target, self.device,
+                    per_proj_ranks=lp.low_rank_ranks)
             if ranks:
                 lr["low_rank_applied"] = 1
 

@@ -9,6 +9,7 @@ Applied to gate_proj, up_proj, down_proj independently.
 
 from __future__ import annotations
 import logging
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -25,10 +26,18 @@ class LowRankFactorizer:
         target_rank: int,
         device: torch.device,
         energy_threshold: float = 0.99,
+        per_proj_ranks: Optional[dict] = None,
     ) -> dict[str, int]:
         """
         Factorize MLP projections via truncated SVD.
         Returns dict of {proj_name: actual_rank_used}.
+
+        Args:
+            per_proj_ranks: Optional dict mapping projection name → target rank.
+                When provided, only projections present in this dict are factorized
+                (projections absent are skipped — their low-rank structure is
+                insufficient to justify compression). Overrides target_rank per
+                projection. When None, all projections use target_rank.
         """
         mlp = getattr(layer, "mlp", None)
         if mlp is None:
@@ -40,13 +49,21 @@ class LowRankFactorizer:
             if mod is None or not isinstance(mod, nn.Linear):
                 continue
 
+            # Determine per-projection rank target
+            if per_proj_ranks is not None:
+                if name not in per_proj_ranks:
+                    continue   # not enough low-rank structure for this projection
+                proj_target_rank = per_proj_ranks[name]
+            else:
+                proj_target_rank = target_rank
+
             W = mod.weight.data.float().to(device)
             m, n = W.shape  # [out_features, in_features]
 
             # Check if factorization actually saves params
             # Original: m*n. Factorized: m*r + r*n = r*(m+n)
             max_useful_rank = (m * n) // (m + n)
-            rank = min(target_rank, max_useful_rank, min(m, n))
+            rank = min(proj_target_rank, max_useful_rank, min(m, n))
 
             if rank >= min(m, n) * 0.95:
                 # Not worth factorizing

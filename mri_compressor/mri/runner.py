@@ -274,6 +274,60 @@ class MRIRunner:
                 max_batches=self.config.max_batches,
             )
 
+        elif study_num == 24:
+            from .studies_domain_compression import (
+                run_domain_compression_curve,
+                load_biomedical_dataset,
+            )
+
+            # Resolve target domain dataset
+            domain_name = getattr(self.config, "custom_domain_name", None) or "biomedical"
+            domain_dataset = None
+
+            # Use custom domain dataset if provided and matches the target domain
+            if self._has_custom_domain():
+                custom = self._load_custom_domain()
+                if custom and domain_name in custom:
+                    domain_dataset = custom[domain_name]
+
+            # Fall back to the built-in biomedical loader
+            if domain_dataset is None:
+                if domain_name != "biomedical":
+                    print(f"  WARNING: custom domain '{domain_name}' not loaded; "
+                          f"using built-in biomedical dataset instead")
+                domain_name = "biomedical"
+                domain_dataset = load_biomedical_dataset(
+                    self.inspector.tokenizer,
+                    max_seq_len=self.config.max_length,
+                    n_samples=min(64, self.config.max_samples),
+                )
+
+            self.results["domain_compression_curve"] = run_domain_compression_curve(
+                self.inspector,
+                domain_dataset=domain_dataset,
+                domain_name=domain_name,
+                batch_size=self.config.batch_size,
+                max_batches_wanda=self.config.max_batches,
+                max_batches_eval=min(8, self.config.max_batches),
+                prior_results=self.results,
+            )
+
+        elif study_num == 25:
+            from .studies_geometry import run_geometry_analysis
+            domain_ds = None
+            if self._has_custom_domain():
+                custom = self._load_custom_domain()
+                if custom:
+                    domain_ds = custom
+            self.results["write_vector_geometry"] = run_geometry_analysis(
+                self.inspector,
+                self.dataset,
+                domain_datasets=domain_ds,
+                batch_size=self.config.batch_size,
+                max_vectors=2000,
+                max_batches=self.config.max_batches,
+            )
+
         else:
             print(f"  Unknown study number: {study_num}")
             return
@@ -285,19 +339,51 @@ class MRIRunner:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Domain names that ship their own data loaders — no file path required.
+    _BUILTIN_CUSTOM_DOMAINS = {"biomedical"}
+
     def _has_custom_domain(self) -> bool:
-        """Check if config has custom domain settings."""
-        return (hasattr(self.config, 'custom_domain_path')
-                and self.config.custom_domain_path is not None
-                and hasattr(self.config, 'custom_domain_name')
-                and self.config.custom_domain_name is not None)
+        """Check if config has custom domain settings.
+
+        Returns True when:
+          - custom_domain_name is set AND custom_domain_path is set  (file or
+            HuggingFace dataset path), OR
+          - custom_domain_name is one of the built-in domains with their own
+            data loaders (e.g. "biomedical" → PubMed).  No path is required.
+        """
+        name = getattr(self.config, "custom_domain_name", None)
+        if not name:
+            return False
+        # Built-in domain — path is optional
+        if name in self._BUILTIN_CUSTOM_DOMAINS:
+            return True
+        # Path-based custom domain
+        return getattr(self.config, "custom_domain_path", None) is not None
 
     def _load_custom_domain(self) -> dict:
-        """Load a custom domain dataset from file or HuggingFace dataset."""
+        """Load a custom domain dataset.
+
+        Handles three cases in order:
+          1. Built-in domain (e.g. "biomedical") — uses its own loader.
+          2. Local text file at custom_domain_path.
+          3. HuggingFace dataset at custom_domain_path.
+        """
         name = self.config.custom_domain_name
-        path = self.config.custom_domain_path
+        path = getattr(self.config, "custom_domain_path", None)
         max_seq_len = self.config.max_length
 
+        # ---- Built-in custom domain ----
+        if name == "biomedical":
+            from .studies_domain_compression import load_biomedical_dataset
+            print(f"  Loading built-in domain 'biomedical' (PubMed abstracts)")
+            dataset = load_biomedical_dataset(
+                self.inspector.tokenizer,
+                max_seq_len=max_seq_len,
+                n_samples=min(64, self.config.max_samples),
+            )
+            return {name: dataset}
+
+        # ---- Path-based custom domain ----
         print(f"  Loading custom domain '{name}' from {path}")
 
         if os.path.isfile(path):

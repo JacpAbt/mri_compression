@@ -59,7 +59,9 @@ class LayerPrescription:
     # Studies 12-21 integrations
     information_retained: float = 1.0  # Study 13: 0-1, how much info this layer preserves
     cka_merge_score: float = 0.0  # Study 17: 0-1, similarity to next layer
-    low_rank_ranks: Optional[dict] = None  # Study 18: {"gate_proj": rank95, "up_proj": ..., "down_proj": ...}
+    low_rank_ranks: Optional[dict] = None  # Study 18: per-proj target ranks {"gate_proj": int, "up_proj": int, "down_proj": int}
+                                            # Only projections with ratio95 < 0.50 are included.
+                                            # Projections absent from the dict are NOT factorized by factorize_mlp.
     cluster_prunable_heads: Optional[list] = None  # Study 19: head indices redundant by clustering
     foldable_neuron_count: int = 0  # Study 20: neurons that can be folded to biases
     foldable_neuron_indices: Optional[list] = None  # Study 20: specific indices
