@@ -8,3 +8,4 @@ from .low_rank import LowRankFactorizer
 from .reconstructor import LocalReconstructor
 from .static_fold import StaticNeuronFolder
 from .weight_sharing import WeightSharer
+from .imprinting import DomainImprinter

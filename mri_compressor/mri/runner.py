@@ -302,6 +302,11 @@ class MRIRunner:
                     n_samples=min(64, self.config.max_samples),
                 )
 
+            # Attach the registered benchmark function for the domain (if any).
+            # For biomedical this gives the PubMedQA accuracy curve alongside PPL.
+            from ..benchmark import DOMAIN_BENCHMARKS
+            benchmark_fn = DOMAIN_BENCHMARKS.get(domain_name)
+
             self.results["domain_compression_curve"] = run_domain_compression_curve(
                 self.inspector,
                 domain_dataset=domain_dataset,
@@ -310,6 +315,9 @@ class MRIRunner:
                 max_batches_wanda=self.config.max_batches,
                 max_batches_eval=min(8, self.config.max_batches),
                 prior_results=self.results,
+                benchmark_fn=benchmark_fn,
+                acc_threshold_absolute=0.05,
+                benchmark_n_samples=100,
             )
 
         elif study_num == 25:

@@ -84,5 +84,9 @@ class ExperimentConfig:
     enable_weight_sharing: bool = False  # off by default, experimental
     low_rank_energy_threshold: float = 0.95
 
+    # ---- Domain Imprinting (post-compression bias injection) ----
+    enable_imprinting: bool = False   # inject domain centroid into down_proj bias
+    imprinting_scale: float = 0.05   # scale factor for centroid projection (tune 0.01–0.10)
+
     def __post_init__(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)

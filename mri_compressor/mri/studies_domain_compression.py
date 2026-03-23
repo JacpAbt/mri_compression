@@ -37,6 +37,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
+from typing import Callable
 from typing import Dict, List, Optional
 
 import torch
@@ -68,6 +69,11 @@ class GlobalCompressionCurveReport:
     global_ppl_curve: List[float]       # PPL with ALL layers pruned at each level
     safe_global_sparsity: float         # Highest level that stays within PPL budget
     elbow_ppl_delta: float              # PPL delta (absolute) at the safe global level
+    # Accuracy tracking (populated when a benchmark_fn is provided)
+    baseline_accuracy: Optional[float] = None                        # Accuracy before pruning
+    global_accuracy_curve: List[float] = field(default_factory=list) # Accuracy at each level
+    safe_global_sparsity_accuracy: float = 0.0                       # Highest level within acc threshold
+    safe_global_sparsity_joint: float = 0.0                          # min(PPL-safe, accuracy-safe)
 
 
 # ===========================================================================
@@ -214,6 +220,9 @@ def run_domain_compression_curve(
     sparsity_levels: Optional[List[float]] = None,
     ppl_threshold_relative: float = 0.15,
     prior_results: Optional[Dict] = None,
+    benchmark_fn: Optional[Callable] = None,
+    acc_threshold_absolute: float = 0.05,
+    benchmark_n_samples: int = 100,
 ) -> Dict:
     """
     Study 24: Domain Compression Curve.
@@ -222,6 +231,10 @@ def run_domain_compression_curve(
     maximum safe fraction of domain-unimportant neurons that can be removed
     while keeping the target-domain PPL increase below ppl_threshold_relative.
 
+    The global cumulative sweep additionally tracks task accuracy (if
+    benchmark_fn is provided) so the safe compression level accounts for
+    both PPL degradation and reasoning capability degradation.
+
     Args:
         inspector:              ModelInspector with loaded model.
         domain_dataset:         Pre-tokenized TextDataset for the target domain.
@@ -229,18 +242,29 @@ def run_domain_compression_curve(
         batch_size:             Batch size for Wanda score computation and eval.
         max_batches_wanda:      Max batches for computing Wanda scores (if not reused).
         max_batches_eval:       Max batches for each quick PPL evaluation.
-        sparsity_levels:        Sparsity fractions to test (default: 10%–50%).
+        sparsity_levels:        Sparsity fractions to test (default: 10%–70%).
         ppl_threshold_relative: Max allowed fractional PPL increase (default: 15%).
         prior_results:          Optional runner results dict; if Study 22 was run
                                 with this domain, its Wanda scores are reused.
+        benchmark_fn:           Optional callable (model, tokenizer, device, n_samples)
+                                -> dict{"accuracy": float}.  When provided, task
+                                accuracy is measured at each global sparsity level
+                                alongside PPL.  The joint-safe threshold considers
+                                both metrics.
+        acc_threshold_absolute: Maximum allowed absolute accuracy drop (default: 0.05
+                                = 5 percentage points) for the accuracy-safe threshold.
+        benchmark_n_samples:    Number of benchmark samples per sparsity level
+                                (default: 100 — fast but stable).
 
     Returns:
         dict with keys:
-            "reports":          List[DomainCompressionCurveReport], one per layer.
-            "baseline_ppl":     Domain PPL before any pruning.
-            "domain_name":      The domain name.
-            "sparsity_levels":  The levels tested.
+            "reports":           List[DomainCompressionCurveReport], one per layer.
+            "baseline_ppl":      Domain PPL before any pruning.
+            "domain_name":       The domain name.
+            "sparsity_levels":   The levels tested.
             "avg_safe_sparsity": Mean safe sparsity across layers.
+            "global_curve":      GlobalCompressionCurveReport (includes accuracy if
+                                 benchmark_fn was provided).
     """
     if sparsity_levels is None:
         sparsity_levels = [0.10, 0.20, 0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70]
@@ -250,6 +274,9 @@ def run_domain_compression_curve(
     print(f"  Target domain:   {domain_name}")
     print(f"  Sparsity levels: {[f'{s:.0%}' for s in sparsity_levels]}")
     print(f"  PPL threshold:   +{ppl_threshold_relative * 100:.0f}% relative")
+    if benchmark_fn is not None:
+        print(f"  Acc threshold:   -{acc_threshold_absolute * 100:.0f}pp absolute  "
+              f"(n={benchmark_n_samples} per level)")
     print("=" * 80)
 
     # ---- Step 1: Domain Wanda scores ----
@@ -365,7 +392,7 @@ def run_domain_compression_curve(
     print(f"    Previous fixed cap was 5% — "
           f"avg improvement: {max(0.0, avg_safe - 0.05):.1%} additional headroom")
 
-    # ---- Global cumulative sweep ----
+    # ---- Global cumulative sweep (PPL + optional accuracy) ----
     global_sparsity_levels = [0.10, 0.20, 0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70]
     global_curve = _run_global_compression_curve(
         inspector=inspector,
@@ -378,6 +405,9 @@ def run_domain_compression_curve(
         per_layer_avg_safe=avg_safe,
         sparsity_levels=global_sparsity_levels,
         ppl_threshold_relative=ppl_threshold_relative,
+        benchmark_fn=benchmark_fn,
+        acc_threshold_absolute=acc_threshold_absolute,
+        benchmark_n_samples=benchmark_n_samples,
     )
 
     return {
@@ -394,6 +424,36 @@ def run_domain_compression_curve(
 # Study 24b: Global cumulative compression sweep
 # ===========================================================================
 
+def _apply_global_sparsity(
+    inspector,
+    wanda_by_layer: Dict,
+    sorted_by_layer: Dict,
+    sparsity: float,
+) -> Dict[int, tuple]:
+    """Zero all layers at *sparsity*. Returns backups dict for restoration."""
+    backups: Dict[int, tuple] = {}
+    for layer_idx in sorted(sorted_by_layer.keys()):
+        mlp_layer = inspector.mlp_layers[layer_idx]
+        if mlp_layer is None:
+            continue
+        n_neurons = wanda_by_layer[layer_idx].shape[0]
+        k = int(n_neurons * sparsity)
+        if k == 0:
+            continue
+        neuron_indices = sorted_by_layer[layer_idx][:k].tolist()
+        backup = _zero_neurons_in_down_proj(mlp_layer, neuron_indices)
+        backups[layer_idx] = (neuron_indices, backup)
+    return backups
+
+
+def _restore_global_sparsity(inspector, backups: Dict[int, tuple]) -> None:
+    """Restore all layers from *backups* dict produced by _apply_global_sparsity."""
+    for layer_idx, (neuron_indices, backup) in backups.items():
+        _restore_neurons_in_down_proj(
+            inspector.mlp_layers[layer_idx], neuron_indices, backup
+        )
+
+
 def _run_global_compression_curve(
     inspector,
     domain_dataset,
@@ -405,32 +465,30 @@ def _run_global_compression_curve(
     per_layer_avg_safe: float,
     sparsity_levels: Optional[List[float]] = None,
     ppl_threshold_relative: float = 0.15,
+    benchmark_fn: Optional[Callable] = None,
+    acc_threshold_absolute: float = 0.05,
+    benchmark_n_samples: int = 100,
 ) -> "GlobalCompressionCurveReport":
     """
     Global cumulative compression sweep for Study 24.
 
-    Unlike the per-layer scan (which ablates one layer at a time), this zeros
-    ALL MLP layers simultaneously at the same sparsity level, then measures
-    a single PPL. This reveals the compound/cascading error that accumulates
-    as the residual stream degrades through successive pruned layers.
+    Zeros ALL MLP layers simultaneously at each sparsity level, measuring
+    domain PPL and (optionally) task accuracy.  This reveals the compound
+    cascading error that accumulates as the residual stream degrades through
+    successive pruned layers.
 
-    Reuses the Wanda scores and baseline PPL already computed by the per-layer
-    sweep, so no additional forward passes for calibration are needed.
+    When benchmark_fn is provided:
+      - Accuracy is measured at the baseline (0% sparsity) and at each level.
+      - safe_global_sparsity_accuracy: highest level where accuracy drop
+        stays within acc_threshold_absolute.
+      - safe_global_sparsity_joint: min(ppl-safe, acc-safe) — the level
+        where BOTH metrics are within their respective thresholds.
 
     Args:
-        inspector:              ModelInspector with loaded model.
-        domain_dataset:         Pre-tokenized TextDataset for the target domain.
-        domain_name:            Domain name (for logging).
-        batch_size:             Batch size for PPL evaluation.
-        max_batches_eval:       Max batches per PPL evaluation.
-        wanda_by_layer:         Dict[layer_idx → Tensor] of domain Wanda scores.
-        baseline_ppl:           Domain PPL with no pruning applied.
-        per_layer_avg_safe:     Average safe sparsity from per-layer scan (for report).
-        sparsity_levels:        Sparsity fractions to test (default: 10%–60%).
-        ppl_threshold_relative: Max fractional PPL increase allowed (default: 15%).
-
-    Returns:
-        GlobalCompressionCurveReport
+        benchmark_fn            : callable(model, tokenizer, device, n_samples)
+                                  -> dict{"accuracy": float} | None
+        acc_threshold_absolute  : Max absolute accuracy drop in [0, 1] (default 0.05).
+        benchmark_n_samples     : Samples per accuracy evaluation (default 100).
     """
     if sparsity_levels is None:
         sparsity_levels = [0.10, 0.20, 0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70]
@@ -440,72 +498,131 @@ def _run_global_compression_curve(
     for layer_idx, scores in wanda_by_layer.items():
         sorted_by_layer[layer_idx] = scores.argsort()
 
+    run_accuracy = benchmark_fn is not None
+
+    # ---- Baseline accuracy (no pruning) ----
+    baseline_accuracy: Optional[float] = None
+    if run_accuracy:
+        print(f"\n  Measuring baseline task accuracy (n={benchmark_n_samples})...")
+        result = benchmark_fn(
+            inspector.model, inspector.tokenizer, inspector.device,
+            n_samples=benchmark_n_samples,
+        )
+        baseline_accuracy = result.get("accuracy", 0.0)
+        print(f"  Baseline accuracy: {baseline_accuracy:.1%}")
+
     global_ppls: List[float] = []
+    global_accs: List[float] = []
 
     for sparsity in sparsity_levels:
-        # --- Zero ALL layers at this sparsity ---
-        backups: Dict[int, tuple] = {}  # layer_idx → (neuron_indices, backup_tensor)
-        for layer_idx in sorted(sorted_by_layer.keys()):
-            mlp_layer = inspector.mlp_layers[layer_idx]
-            if mlp_layer is None:
-                continue
-            scores = wanda_by_layer[layer_idx]
-            n_neurons = scores.shape[0]
-            k = int(n_neurons * sparsity)
-            if k == 0:
-                continue
-            neuron_indices = sorted_by_layer[layer_idx][:k].tolist()
-            backup = _zero_neurons_in_down_proj(mlp_layer, neuron_indices)
-            backups[layer_idx] = (neuron_indices, backup)
+        # --- Zero ALL layers simultaneously ---
+        backups = _apply_global_sparsity(
+            inspector, wanda_by_layer, sorted_by_layer, sparsity
+        )
 
-        # --- Single PPL measurement with all layers pruned ---
+        # --- PPL measurement ---
         ppl_all = _quick_eval_ppl(
             inspector.model, domain_dataset, inspector.device,
             batch_size=batch_size, max_batches=max_batches_eval,
         )
+        global_ppls.append(ppl_all)
+
+        # --- Accuracy measurement (same pruned state, no extra zeroing) ---
+        if run_accuracy:
+            acc_result = benchmark_fn(
+                inspector.model, inspector.tokenizer, inspector.device,
+                n_samples=benchmark_n_samples,
+            )
+            global_accs.append(acc_result.get("accuracy", 0.0))
 
         # --- Restore all layers ---
-        for layer_idx, (neuron_indices, backup) in backups.items():
-            mlp_layer = inspector.mlp_layers[layer_idx]
-            _restore_neurons_in_down_proj(mlp_layer, neuron_indices, backup)
-
-        global_ppls.append(ppl_all)
+        _restore_global_sparsity(inspector, backups)
         del backups
         gc.collect()
 
-    # Find safe global sparsity
-    safe_global = 0.0
+    # ---- PPL-based safe threshold ----
+    safe_global_ppl = 0.0
     elbow_delta = 0.0
     for sp, ppl_val in zip(sparsity_levels, global_ppls):
         rel_delta = (ppl_val / baseline_ppl - 1.0) if baseline_ppl > 0 else 0.0
         if rel_delta < ppl_threshold_relative:
-            safe_global = sp
+            safe_global_ppl = sp
             elbow_delta = ppl_val - baseline_ppl
         else:
             break
 
-    # Print global sweep table
-    print(f"\n  Global cumulative sweep (all {len(sorted_by_layer)} layers zeroed simultaneously):")
-    header = "  Sparsity |" + "".join(f" {sp:>6.0%} |" for sp in sparsity_levels)
+    # ---- Accuracy-based safe threshold ----
+    safe_global_acc = 0.0
+    if run_accuracy and baseline_accuracy is not None:
+        for sp, acc_val in zip(sparsity_levels, global_accs):
+            acc_drop = baseline_accuracy - acc_val   # positive = degraded
+            if acc_drop <= acc_threshold_absolute:
+                safe_global_acc = sp
+            else:
+                break
+
+    safe_global_joint = (
+        min(safe_global_ppl, safe_global_acc) if run_accuracy else safe_global_ppl
+    )
+
+    # ---- Print table ----
+    n_layers = len(sorted_by_layer)
+    print(f"\n  Global cumulative sweep (all {n_layers} layers zeroed simultaneously):")
+
+    col_w = 8
+    header = "  Sparsity |" + "".join(f" {f'{sp:.0%}':>{col_w}} |" for sp in sparsity_levels)
     print(header)
-    ppl_row = "  PPL      |" + "".join(f" {p:>6.2f} |" for p in global_ppls)
+
+    ppl_row = "  PPL      |" + "".join(f" {p:>{col_w}.2f} |" for p in global_ppls)
     print(ppl_row)
+
     pct_row = "  PPL Δ%   |" + "".join(
-        f" {(p / baseline_ppl - 1) * 100:>+5.1f}% |" for p in global_ppls
+        f" {(p / baseline_ppl - 1) * 100:>+{col_w-1}.1f}% |" for p in global_ppls
     )
     print(pct_row)
-    print(f"  Safe global sparsity: {safe_global:.0%}  "
-          f"(per-layer avg was {per_layer_avg_safe:.1%})")
-    if safe_global < per_layer_avg_safe:
-        gap = per_layer_avg_safe - safe_global
-        print(f"  ⚠  Compound error reduces safe limit by {gap:.1%} vs. single-layer estimate")
+
+    if run_accuracy and global_accs:
+        acc_row = "  Accuracy |" + "".join(
+            f" {a:>{col_w}.1%} |" for a in global_accs
+        )
+        print(acc_row)
+        acc_delta_row = "  Acc Δ    |" + "".join(
+            f" {(a - baseline_accuracy):>+{col_w-1}.1%} |" for a in global_accs
+        )
+        print(acc_delta_row)
+
+    # ---- Summary lines ----
+    print(f"\n  Safe global sparsity (PPL  ≤ +{ppl_threshold_relative:.0%}):  "
+          f"{safe_global_ppl:.0%}  (per-layer avg was {per_layer_avg_safe:.1%})")
+    if safe_global_ppl < per_layer_avg_safe:
+        gap = per_layer_avg_safe - safe_global_ppl
+        print(f"  ⚠  Compound error reduces PPL-safe limit by "
+              f"{gap:.1%} vs. single-layer estimate")
+
+    if run_accuracy:
+        print(f"  Safe global sparsity (Acc  ≥ -{acc_threshold_absolute:.0%}):  "
+              f"{safe_global_acc:.0%}")
+        print(f"  Safe global sparsity (joint, both):                    "
+              f"{safe_global_joint:.0%}")
+        if safe_global_acc < safe_global_ppl:
+            print(f"  ⚠  Accuracy is the binding constraint "
+                  f"(tighter than PPL by {safe_global_ppl - safe_global_acc:.0%})")
+        elif safe_global_ppl < safe_global_acc:
+            print(f"  ⚠  PPL is the binding constraint "
+                  f"(tighter than accuracy by {safe_global_acc - safe_global_ppl:.0%})")
+        else:
+            print(f"  ✓  PPL and accuracy constraints agree at {safe_global_joint:.0%}")
 
     return GlobalCompressionCurveReport(
         domain_baseline_ppl=baseline_ppl,
         sparsity_levels=list(sparsity_levels),
         global_ppl_curve=global_ppls,
-        safe_global_sparsity=safe_global,
+        safe_global_sparsity=safe_global_ppl,
         elbow_ppl_delta=elbow_delta,
+        baseline_accuracy=baseline_accuracy,
+        global_accuracy_curve=global_accs if run_accuracy else [],
+        safe_global_sparsity_accuracy=safe_global_acc,
+        safe_global_sparsity_joint=safe_global_joint,
     )
 
 

@@ -224,14 +224,108 @@ def run_diagnosis_stage(summary: dict, config: ExperimentConfig) -> object:
     return prescription
 
 
+def run_imprinting_stage(
+    inspector: ModelInspector,
+    config: ExperimentConfig,
+    domain_dataloader=None,
+    pre_computed_centroids=None,
+) -> dict:
+    """
+    Stage 3.5 (optional): Domain Imprinting.
+
+    Injects per-layer domain activation centroids into each down_proj bias.
+    No retraining.  Partial recovery of domain PPL degradation from compression.
+
+    Parameters
+    ----------
+    pre_computed_centroids : Optional dict[layer_idx -> Tensor(hidden_size,)]
+        Output-space centroids computed from the *original* model before
+        compression (via DomainImprinter.compute_output_centroids).
+        When provided, the cleaner pre-compression domain signal is used
+        instead of recomputing centroids on the already-compressed model.
+
+    Returns the imprinting report dict (pre/post PPL, recovery %).
+    """
+    from .compression.compressor import MRICompressor
+
+    print("\n" + "=" * 80)
+    print("STAGE 3.5: DOMAIN IMPRINTING")
+    centroid_src = "original model" if pre_computed_centroids is not None else "compressed model"
+    print(f"  Scale: {config.imprinting_scale:.3f}  |  Domain: {config.target_domain}"
+          f"  |  Centroids from: {centroid_src}")
+    print("=" * 80)
+
+    if domain_dataloader is None:
+        domain_dataloader = _create_domain_dataloader(
+            config.target_domain, inspector.tokenizer,
+            max_seq_len=config.max_length, batch_size=config.batch_size,
+            custom_path=config.custom_domain_path,
+            custom_name=config.custom_domain_name,
+        )
+
+    if domain_dataloader is None:
+        print("  Warning: domain dataloader unavailable — imprinting skipped.")
+        return {}
+
+    # Build a minimal compressor wrapper just to call apply_domain_imprinting()
+    from .data_utils import load_wikitext_data, get_dataloader
+    dataset = load_wikitext_data(
+        inspector.tokenizer,
+        max_seq_len=config.max_length,
+        num_samples=config.max_samples,
+    )
+    dataloader = get_dataloader(dataset, batch_size=config.batch_size)
+
+    from .compression.prescription import CompressionPrescription
+    dummy_prescription = CompressionPrescription(
+        model_name=config.model_name,
+        baseline_ppl=0.0,
+        num_layers=inspector.num_layers,
+        intermediate_size=inspector.mlp_layers[0].intermediate_size,
+        layers=[],
+    )
+
+    compressor = MRICompressor(
+        model=inspector.model,
+        tokenizer=inspector.tokenizer,
+        prescription=dummy_prescription,
+        calibration_dataloader=dataloader,
+        device=inspector.device,
+        domain_calibration_dataloader=domain_dataloader,
+        inspector=inspector,
+        enable_imprinting=True,
+        imprinting_scale=config.imprinting_scale,
+    )
+
+    report = compressor.apply_domain_imprinting(
+        domain_dataloader=domain_dataloader,
+        scale=config.imprinting_scale,
+        pre_computed_centroids=pre_computed_centroids,
+    )
+    return report
+
+
 def run_compression_stage(
     inspector: ModelInspector,
     prescription: object,
     config: ExperimentConfig,
     summary: dict,
-) -> object:
-    """Stage 3: Apply compression prescription to the model."""
+) -> tuple:
+    """
+    Stage 3: Apply compression prescription to the model.
+
+    Returns
+    -------
+    (result, original_centroids)
+        result              : CompressionResult from MRICompressor.compress()
+        original_centroids  : dict[layer_idx -> Tensor(hidden_size,)] computed
+                              from the original model BEFORE compression, or
+                              None if imprinting is disabled / no domain set.
+                              These are passed to run_imprinting_stage() so the
+                              cleaner, undamaged domain signal is used.
+    """
     from .compression.compressor import MRICompressor
+    from .compression.operations.imprinting import DomainImprinter
 
     print("\n" + "=" * 80)
     print("STAGE 3: COMPRESSION")
@@ -244,7 +338,7 @@ def run_compression_stage(
     )
     dataloader = get_dataloader(dataset, batch_size=config.batch_size)
 
-    # Create domain-specific calibration dataloader when target_domain is set
+    # Domain dataloader (used for both reconstruction and centroid capture)
     domain_dataloader = None
     if config.target_domain:
         domain_dataloader = _create_domain_dataloader(
@@ -255,6 +349,21 @@ def run_compression_stage(
         )
         if domain_dataloader is not None:
             print(f"  Using domain-specific reconstruction data: {config.target_domain}")
+
+    # ------------------------------------------------------------------ #
+    #  Capture original-model centroids BEFORE compression destroys them  #
+    # ------------------------------------------------------------------ #
+    original_centroids = None
+    if config.enable_imprinting and domain_dataloader is not None:
+        print("\n  Pre-computing domain centroids from original model (output space)...")
+        original_centroids = DomainImprinter.compute_output_centroids(
+            model=inspector.model,
+            inspector=inspector,
+            domain_dataloader=domain_dataloader,
+            device=inspector.device,
+            max_batches=16,
+        )
+        print(f"  Original centroids captured for {len(original_centroids)} layers.")
 
     compressor = MRICompressor(
         model=inspector.model,
@@ -274,7 +383,7 @@ def run_compression_stage(
     )
 
     result = compressor.compress()
-    return result
+    return result, original_centroids
 
 
 def _create_domain_dataloader(
@@ -355,8 +464,9 @@ def run_evaluation_stage(
     config: ExperimentConfig,
     baseline_ppl: float,
     domain_baseline_ppl=None,
+    baseline_benchmark: dict = None,
 ) -> dict:
-    """Stage 4: Evaluate compressed model."""
+    """Stage 4: Evaluate compressed model (PPL + optional domain benchmark)."""
     print("\n" + "=" * 80)
     print("STAGE 4: EVALUATION")
     print("=" * 80)
@@ -395,6 +505,19 @@ def run_evaluation_stage(
                 max_batches=8,
             )
 
+    # ---- Domain benchmark (accuracy on downstream task) ----
+    compressed_benchmark = None
+    if config.target_domain:
+        from .benchmark import run_domain_benchmark, DOMAIN_BENCHMARKS
+        if config.target_domain in DOMAIN_BENCHMARKS:
+            compressed_benchmark = run_domain_benchmark(
+                config.target_domain,
+                inspector.model,
+                inspector.tokenizer,
+                inspector.device,
+                n_samples=200,
+            )
+
     # ---- Print ----
     if config.target_domain and domain_compressed_ppl is not None:
         # Domain mode: domain PPL is the headline; wikitext shown as tradeoff reference
@@ -415,6 +538,18 @@ def run_evaluation_stage(
         print(f"  Compressed PPL:  {compressed_ppl:.2f}")
         print(f"  PPL increase:    {ppl_increase:.2f} ({ppl_increase_pct:+.1f}%)")
 
+    # Print benchmark comparison if we have both baseline and compressed scores
+    if compressed_benchmark and baseline_benchmark:
+        base_acc = baseline_benchmark.get("accuracy", 0.0)
+        comp_acc = compressed_benchmark.get("accuracy", 0.0)
+        delta    = comp_acc - base_acc
+        print(f"\n  Benchmark ({compressed_benchmark.get('dataset', config.target_domain)}):")
+        print(f"    Accuracy:  {base_acc:.1%} → {comp_acc:.1%}  ({delta:+.1%})")
+    elif compressed_benchmark:
+        comp_acc = compressed_benchmark.get("accuracy", 0.0)
+        print(f"\n  Benchmark ({compressed_benchmark.get('dataset', config.target_domain)}):")
+        print(f"    Compressed accuracy: {comp_acc:.1%}")
+
     print(f"  Total parameters: {total_params:,}")
 
     eval_report = {
@@ -428,6 +563,10 @@ def run_evaluation_stage(
         eval_report["domain"] = config.target_domain
         eval_report["domain_baseline_ppl"] = domain_baseline_ppl
         eval_report["domain_compressed_ppl"] = domain_compressed_ppl
+    if compressed_benchmark:
+        eval_report["benchmark"] = compressed_benchmark
+    if baseline_benchmark:
+        eval_report["baseline_benchmark"] = baseline_benchmark
 
     # Save evaluation report
     report_path = os.path.join(config.output_dir, "evaluation_report.json")
@@ -480,6 +619,8 @@ def run_pipeline(args):
         enable_low_rank=not args.disable_low_rank,
         enable_static_fold=not args.disable_static_fold,
         enable_weight_sharing=args.enable_weight_sharing,
+        enable_imprinting=getattr(args, "imprint", False),
+        imprinting_scale=getattr(args, "imprint_scale", 0.05),
     )
 
     # Load model
@@ -530,12 +671,49 @@ def run_pipeline(args):
         # Stage 2: Diagnosis
         prescription = run_diagnosis_stage(summary, config)
 
+        # Baseline benchmark — measured on the ORIGINAL model before compression
+        # so we can report a clean before/after comparison in Stage 4.
+        baseline_benchmark = None
+        if config.target_domain:
+            from .benchmark import run_domain_benchmark, DOMAIN_BENCHMARKS
+            if config.target_domain in DOMAIN_BENCHMARKS:
+                print(f"\n  Measuring baseline benchmark ({config.target_domain}) "
+                      f"on original model...")
+                baseline_benchmark = run_domain_benchmark(
+                    config.target_domain,
+                    inspector.model,
+                    inspector.tokenizer,
+                    inspector.device,
+                    n_samples=200,
+                )
+
         # Stage 3: Compression
-        result = run_compression_stage(inspector, prescription, config, summary)
+        # Returns (result, original_centroids); centroids are captured from the
+        # original model before it is modified, then passed to imprinting.
+        result, original_centroids = run_compression_stage(
+            inspector, prescription, config, summary
+        )
+
+        # Stage 3.5: Domain Imprinting (optional, requires --imprint and --domain)
+        imprint_report = {}
+        if config.enable_imprinting and config.target_domain:
+            imprint_report = run_imprinting_stage(
+                inspector, config,
+                pre_computed_centroids=original_centroids,
+            )
+            # Persist imprinting report alongside the evaluation report
+            imprint_path = os.path.join(config.output_dir, "imprinting_report.json")
+            with open(imprint_path, "w") as _f:
+                import json as _json
+                _json.dump(imprint_report, _f, indent=2, default=str)
+            print(f"\n  Imprinting report saved to {imprint_path}")
 
         # Stage 4: Evaluation
-        eval_report = run_evaluation_stage(inspector, config, baseline_ppl,
-                                           domain_baseline_ppl=domain_baseline_ppl)
+        eval_report = run_evaluation_stage(
+            inspector, config, baseline_ppl,
+            domain_baseline_ppl=domain_baseline_ppl,
+            baseline_benchmark=baseline_benchmark,
+        )
 
         # Save compressed model
         if args.save_model:
@@ -665,6 +843,25 @@ EXAMPLES
                         help="Disable static neuron folding")
     parser.add_argument("--enable-weight-sharing", action="store_true",
                         help="Enable weight sharing between similar layers (experimental)")
+
+    # ---- Domain Imprinting ----
+    parser.add_argument(
+        "--imprint", action="store_true", dest="imprint",
+        help=(
+            "After compression, inject per-layer domain activation centroids into "
+            "down_proj biases (domain imprinting).  Requires --domain.  "
+            "No retraining — pure bias shift toward the domain manifold."
+        ),
+    )
+    parser.add_argument(
+        "--imprint-scale", type=float, default=0.05, dest="imprint_scale",
+        metavar="S",
+        help=(
+            "Scale factor for domain centroid injection (default: 0.05).  "
+            "Typical range 0.01–0.10.  Higher = stronger domain prior, "
+            "may hurt general PPL."
+        ),
+    )
 
     # ---- Output ----
     parser.add_argument("--output", type=str, default="./results",

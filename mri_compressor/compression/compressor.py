@@ -48,6 +48,7 @@ from .operations import (
     LocalReconstructor,
     StaticNeuronFolder,
     WeightSharer,
+    DomainImprinter,
 )
 from ._utils import (get_intermediate_size, get_mlp_modules, get_mlp_submodule,
                      resolve_layer, _find_attn_output_proj)
@@ -248,6 +249,8 @@ class MRICompressor:
         enable_weight_sharing: bool = False,
         domain_calibration_dataloader=None,
         inspector=None,
+        enable_imprinting: bool = False,
+        imprinting_scale: float = 0.05,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -265,6 +268,8 @@ class MRICompressor:
         self.enable_static_fold = enable_static_fold
         self.enable_weight_sharing = enable_weight_sharing
         self.inspector = inspector  # Optional ModelInspector for arch-agnostic layer resolution
+        self.enable_imprinting = enable_imprinting
+        self.imprinting_scale = imprinting_scale
         # d_model needed to locate attention output projections (Studies 6+23)
         _cfg = getattr(model, "config", None)
         self.hidden_size: int = getattr(_cfg, "hidden_size", 0)
@@ -756,6 +761,109 @@ class MRICompressor:
         gc.collect()
         torch.cuda.empty_cache()
         return lr
+
+    def apply_domain_imprinting(
+        self,
+        domain_dataloader=None,
+        scale: float | None = None,
+        max_batches: int = 16,
+        pre_computed_centroids=None,
+    ) -> dict:
+        """
+        Post-compression domain imprinting pass.
+
+        Injects per-layer domain activation centroids into the down_proj bias
+        of every layer, tilting each layer's output toward the domain manifold
+        without any gradient-based training.
+
+        Parameters
+        ----------
+        domain_dataloader     : DataLoader with domain text (uses internal one if None).
+        scale                 : Overrides self.imprinting_scale when provided.
+        max_batches           : Calibration batches for centroid estimation.
+        pre_computed_centroids: Optional dict[layer_idx -> Tensor(hidden_size,)]
+                                computed from the *original* model via
+                                DomainImprinter.compute_output_centroids().
+                                When supplied, centroids are injected directly
+                                (no W_down projection) using the cleaner,
+                                undamaged domain signal from before compression.
+                                When None, centroids are computed fresh on the
+                                compressed model (original behaviour).
+
+        Returns
+        -------
+        dict with keys:
+            "pre_imprint_domain_ppl"   – domain PPL before imprinting
+            "post_imprint_domain_ppl"  – domain PPL after imprinting
+            "ppl_recovered"            – absolute PPL recovered (positive = improvement)
+            "ppl_recovered_pct"        – recovery as % of the pre-imprint PPL
+            "per_layer"                – per-layer centroid/delta norms
+            "used_original_centroids"  – True when pre_computed_centroids were used
+        """
+        dl = domain_dataloader or self.domain_dataloader
+        if dl is None:
+            logger.warning(
+                "apply_domain_imprinting: no domain dataloader available — skipping"
+            )
+            return {}
+
+        if self.inspector is None:
+            logger.warning(
+                "apply_domain_imprinting: inspector required — skipping"
+            )
+            return {}
+
+        _scale = scale if scale is not None else self.imprinting_scale
+
+        # --- PPL before imprinting (domain) ---
+        pre_ppl = self._evaluate_ppl_on(dl, max_batches=8)
+        print(f"\n  Domain PPL before imprinting:  {pre_ppl:.4f}")
+
+        # --- Compute / inject centroids ---
+        per_layer = DomainImprinter.imprint(
+            model=self.model,
+            inspector=self.inspector,
+            domain_dataloader=dl,
+            device=self.device,
+            scale=_scale,
+            max_batches=max_batches,
+            pre_computed_centroids=pre_computed_centroids,
+        )
+
+        # --- PPL after imprinting (domain) ---
+        post_ppl = self._evaluate_ppl_on(dl, max_batches=8)
+        recovered = pre_ppl - post_ppl
+        recovered_pct = (recovered / pre_ppl * 100) if pre_ppl > 0 else 0.0
+
+        print(f"  Domain PPL after  imprinting:  {post_ppl:.4f}")
+        if recovered > 0:
+            print(f"  PPL recovered:                 {recovered:.4f}  ({recovered_pct:+.1f}%)")
+        else:
+            print(f"  PPL change:                    {recovered:.4f}  ({recovered_pct:+.1f}%)")
+
+        return {
+            "pre_imprint_domain_ppl":   pre_ppl,
+            "post_imprint_domain_ppl":  post_ppl,
+            "ppl_recovered":            recovered,
+            "ppl_recovered_pct":        recovered_pct,
+            "per_layer":                per_layer,
+            "used_original_centroids":  pre_computed_centroids is not None,
+        }
+
+    @torch.no_grad()
+    def _evaluate_ppl_on(self, dataloader, max_batches: int = 8) -> float:
+        """Evaluate perplexity on an arbitrary dataloader."""
+        self.model.eval()
+        total_loss, total_tok = 0.0, 0
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            ids = batch["input_ids"].to(self.device)
+            out = self.model(input_ids=ids, labels=ids)
+            seq_len = ids.shape[1] - 1
+            total_loss += out.loss.item() * seq_len * ids.shape[0]
+            total_tok += seq_len * ids.shape[0]
+        return math.exp(total_loss / max(total_tok, 1))
 
     @torch.no_grad()
     def _evaluate_ppl(self, max_batches: int = 8) -> float:
