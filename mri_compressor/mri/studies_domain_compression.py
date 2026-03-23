@@ -813,6 +813,195 @@ def _synthesize_biomedical_texts(n: int = 200) -> List[str]:
     return [random.choice(texts) for _ in range(n)]
 
 
+def load_biomedical_qa_dataset(
+    tokenizer,
+    max_seq_len: int = 512,
+    n_samples: int = 64,
+) -> "TextDataset":
+    """
+    Load PubMedQA as QA-formatted prompts for TASK-AWARE Wanda scoring.
+
+    Why this matters
+    ----------------
+    Standard Wanda scores are computed on plain biomedical text.  This weights
+    neurons that activate on biomedical *vocabulary and syntax* (fluency
+    neurons).  Neurons responsible for *reasoning and judgment* — especially
+    the uncertainty circuit that produces "maybe" answers — have low activation
+    on plain text and are therefore incorrectly ranked as domain-unimportant.
+
+    By using QA-formatted prompts that include the answer token, we force the
+    model to perform the decision step during calibration.  The neurons that
+    fire when the model commits to "yes", "no", or "maybe" get high activation
+    scores and are consequently protected from removal.
+
+    Format: "Context: {abstract}\\nQuestion: {question}\\nAnswer: {label}"
+    All three classes are represented so every part of the decision circuit
+    is activated.  We also include prompt-only versions ("Answer:") to capture
+    the neurons that activate at the decision boundary itself.
+
+    Falls back to load_biomedical_dataset() if PubMedQA is unavailable.
+    """
+    from ..data_utils import TextDataset
+    import torch
+
+    print("  Loading biomedical QA calibration dataset (task-aware)...")
+
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
+    except Exception as exc:
+        print(f"    PubMedQA QA load failed ({exc}), falling back to plain text")
+        return load_biomedical_dataset(tokenizer, max_seq_len, n_samples)
+
+    texts = []
+    label_counts = {"yes": 0, "no": 0, "maybe": 0}
+
+    for row in ds:
+        context = row.get("context", {})
+        ctx_text = (
+            " ".join(context.get("contexts", [])) if isinstance(context, dict)
+            else str(context)
+        )
+        question = row.get("question", "")
+        label    = row.get("final_decision", "").lower().strip()
+
+        if label not in label_counts or not ctx_text.strip():
+            continue
+
+        ctx_short = ctx_text[:400]
+
+        # Format 1: full answered prompt — teaches the model what "answering" looks like.
+        # Neurons that fire to produce the answer token get high Wanda scores.
+        texts.append(
+            f"Context: {ctx_short}\nQuestion: {question}\nAnswer: {label}"
+        )
+        # Format 2: prompt at the decision point — captures pre-commitment neurons.
+        texts.append(
+            f"Context: {ctx_short}\nQuestion: {question}\nAnswer:"
+        )
+
+        label_counts[label] += 1
+        if len(texts) >= n_samples * 20:
+            break
+
+    if not texts:
+        print("    No QA texts loaded, falling back to plain text")
+        return load_biomedical_dataset(tokenizer, max_seq_len, n_samples)
+
+    answered = sum(label_counts.values())
+    print(f"    Biomedical QA: {answered} answered prompts "
+          f"(yes={label_counts['yes']}, no={label_counts['no']}, "
+          f"maybe={label_counts['maybe']})")
+
+    all_text = "\n\n".join(texts)
+    tokens   = tokenizer.encode(all_text, return_tensors="pt")[0]
+    n_chunks = min(n_samples, len(tokens) // max_seq_len)
+
+    if n_chunks < 4:
+        repeat_factor = (4 * max_seq_len // max(len(tokens), 1)) + 1
+        tokens  = tokens.repeat(repeat_factor)
+        n_chunks = min(n_samples, len(tokens) // max_seq_len)
+
+    chunks = tokens[:n_chunks * max_seq_len].reshape(n_chunks, max_seq_len)
+    print(f"    Biomedical QA: {n_chunks} chunks of {max_seq_len} tokens")
+    return TextDataset(chunks)
+
+
+def load_class_biomedical_datasets(
+    tokenizer,
+    max_seq_len: int = 512,
+    n_samples: int = 32,
+) -> Dict[str, "TextDataset"]:
+    """
+    Load per-class PubMedQA datasets for class-conditional centroid computation.
+
+    Returns a dict keyed by class name:
+      - "yes"     : QA prompts where the correct answer is "yes"
+      - "no"      : QA prompts where the correct answer is "no"
+      - "maybe"   : QA prompts where the correct answer is "maybe"
+      - "general" : plain PubMed abstract text (domain fluency geometry)
+
+    Intended use
+    ------------
+    Pass the dict to ``DomainImprinter.compute_class_output_centroids()``
+    on the ORIGINAL model before compression, then again on the COMPRESSED
+    model.  The per-class geometry delta is injected via
+    ``DomainImprinter.imprint_class_conditional()`` to restore yes/no/maybe
+    class separation — especially protecting the fragile "maybe" circuit.
+
+    "general" is included at half weight so that domain language fluency is
+    preserved alongside the task-reasoning geometry correction.
+
+    Falls back to an empty dict if PubMedQA is unavailable.
+    """
+    from ..data_utils import TextDataset
+
+    print("  Loading per-class biomedical datasets (class-conditional imprinting)...")
+
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
+    except Exception as exc:
+        print(f"    PubMedQA unavailable ({exc}) — skipping class-conditional setup")
+        return {}
+
+    class_texts: Dict[str, list] = {"yes": [], "no": [], "maybe": [], "general": []}
+
+    for row in ds:
+        context  = row.get("context", {})
+        ctx_text = (
+            " ".join(context.get("contexts", [])) if isinstance(context, dict)
+            else str(context)
+        )
+        question = row.get("question", "")
+        label    = row.get("final_decision", "").lower().strip()
+
+        if label not in ("yes", "no", "maybe") or not ctx_text.strip():
+            continue
+
+        ctx_short = ctx_text[:400]
+
+        # Class-specific: full answered QA prompt.
+        # Captures the neurons that fire when producing the specific answer token.
+        class_texts[label].append(
+            f"Context: {ctx_short}\nQuestion: {question}\nAnswer: {label}"
+        )
+
+        # General: plain abstract text (no task framing).
+        # Captures domain vocabulary / fluency neurons rather than reasoning neurons.
+        class_texts["general"].append(ctx_text[:600])
+
+        # Stop once every class has enough examples
+        if min(len(v) for v in class_texts.values()) >= n_samples * 6:
+            break
+
+    datasets: Dict[str, "TextDataset"] = {}
+    for cls_name, texts in class_texts.items():
+        if not texts:
+            print(f"    Class '{cls_name}': no texts found — skipping")
+            continue
+
+        all_text = "\n\n".join(texts)
+        tokens   = tokenizer.encode(all_text, return_tensors="pt")[0]
+        n_chunks = min(n_samples, len(tokens) // max_seq_len)
+
+        if n_chunks < 2:
+            # Repeat short sequences to reach minimum chunk count
+            repeat_factor = max(1, (2 * max_seq_len) // max(len(tokens), 1) + 1)
+            tokens   = tokens.repeat(repeat_factor)
+            n_chunks = min(n_samples, len(tokens) // max_seq_len)
+
+        if n_chunks < 1:
+            print(f"    Class '{cls_name}': too few tokens — skipping")
+            continue
+
+        chunks = tokens[:n_chunks * max_seq_len].reshape(n_chunks, max_seq_len)
+        datasets[cls_name] = TextDataset(chunks)
+        print(f"    Class '{cls_name}': {n_chunks} chunks of {max_seq_len} tokens")
+
+    return datasets
+
+
 def load_biomedical_dataset(
     tokenizer,
     max_seq_len: int = 512,

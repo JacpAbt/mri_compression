@@ -24,6 +24,48 @@ import os
 from pathlib import Path
 from typing import Optional
 
+
+def _layer_position_scale(layer_idx: int, num_layers: int) -> float:
+    """
+    Return a [0, 1] scaling factor that discounts the compression budget for
+    accuracy-critical boundary layers, based on their position in the network.
+
+    Motivation
+    ----------
+    Study 24 shows that PPL-based safe sparsity is 70%+ for every layer, but
+    task accuracy crashes -20pp at 15.4% global compression. The "maybe" class
+    collapses entirely. This divergence is because:
+
+      - Early layers  parse task structure (question, context boundary).
+      - Middle layers compose features redundantly — most compressible.
+      - Late layers   crystallise predictions into final token probabilities.
+        Layer (N-1) has 5× higher PPL sensitivity than the model average.
+
+    By scaling DOWN the compression budget for boundary layers, we preserve the
+    reasoning circuits that live there while still compressing middle layers
+    aggressively.
+
+    Scale table (approximate, 24-layer model)
+    ------------------------------------------
+    Position              Scale   Rationale
+    Last layer (N-1)      0.10    Output crystallisation; extremely sensitive
+    Top 20% (excl. last)  0.30    Rising sensitivity from Study 24
+    Middle 50–80%         1.00    Most robust; full PPL-safe budget
+    First 25%             0.50    Task-structure encoding; moderately sensitive
+    """
+    if num_layers <= 1:
+        return 1.0
+    last = num_layers - 1
+    if layer_idx == last:
+        return 0.10
+    boundary_start = int(num_layers * 0.80)
+    if layer_idx >= boundary_start:
+        return 0.30
+    middle_start = int(num_layers * 0.25)
+    if layer_idx >= middle_start:
+        return 1.00
+    return 0.50
+
 from .prescription import (
     CompressionStrategy,
     LayerPrescription,
@@ -79,6 +121,8 @@ class MRIDiagnostician:
         target_domain: Optional[str] = None,
         domain_unnecessary_removal_frac: float = 0.05,   # Remove up to 5% of intermediate_size per layer
         domain_critical_protection_frac: float = 0.10,    # Protect top 10% domain-critical neurons
+        # Proportional layer budget (Study 22 post-pass)
+        proportional_budget_margin: float = 2.0,  # No layer compressed > margin × global-average fraction
     ):
         self.heavy_tail_alpha = heavy_tail_alpha
         self.high_redundancy_frac = high_redundancy_frac
@@ -106,6 +150,7 @@ class MRIDiagnostician:
         self.target_domain = target_domain
         self.domain_unnecessary_removal_frac = domain_unnecessary_removal_frac
         self.domain_critical_protection_frac = domain_critical_protection_frac
+        self.proportional_budget_margin = proportional_budget_margin
 
     def diagnose(
         self,
@@ -992,11 +1037,29 @@ class MRIDiagnostician:
                 # This replaces the fixed domain_unnecessary_removal_frac (5%) cap
                 # with a per-layer budget grounded in actual measured PPL impact.
                 s24 = ld.get("study24_domain_compression_curve", {})
-                layer_safe_sparsity = s24.get(
+                ppl_safe_sparsity = s24.get(
                     "safe_domain_sparsity",
                     self.domain_unnecessary_removal_frac,   # fallback: 5% fixed cap
                 )
+
+                # Non-uniform layer scaling: protect boundary layers from accuracy
+                # degradation. PPL alone is too optimistic for early/late layers —
+                # task reasoning circuits live there and are not captured by PPL.
+                # Middle layers (25-80% depth) get the full PPL-safe budget;
+                # boundary layers get a position-scaled fraction of it.
+                pos_scale = _layer_position_scale(lp.layer_idx, num_layers)
+                layer_safe_sparsity = ppl_safe_sparsity * pos_scale
                 max_removable = int(n_neurons * layer_safe_sparsity)
+
+                if pos_scale < 1.0:
+                    logger.debug(
+                        "  Layer %d: PPL-safe=%.1f%%  pos_scale=%.2f  "
+                        "effective_budget=%.1f%%",
+                        lp.layer_idx,
+                        ppl_safe_sparsity * 100,
+                        pos_scale,
+                        layer_safe_sparsity * 100,
+                    )
 
                 # Study 25: read domain divergence angle — used only for re-ranking, not budget.
                 # Low angle → layer is domain-agnostic → domain-Wanda less reliable → geometry
@@ -1117,6 +1180,73 @@ class MRIDiagnostician:
                         logger.info(
                             f"    Layer {lp.layer_idx}: +{len(unnecessary)} domain-unnecessary "
                             f"neurons on top of {lp.strategy.name}")
+
+        # ---- Proportional layer budget: prevent information bottlenecks ----
+        #
+        # After computing per-layer removal counts, ensure no single layer is
+        # compressed more than (proportional_budget_margin × global_avg_fraction).
+        #
+        # Motivation
+        # ----------
+        # With non-uniform PPL-safe budgets a middle layer might lose 35% of its
+        # neurons while boundary layers lose only 3%.  While each decision is
+        # individually PPL-safe (from Study 24), the resulting SHAPE asymmetry
+        # means a thin middle layer processes the full residual stream after a
+        # wide preceding layer — creating a computational bottleneck analogous
+        # to a narrow pipe in a flow system.
+        #
+        # The proportional cap preserves the relative width distribution of the
+        # network.  It does NOT override the position-scaling (pos_scale) from
+        # _layer_position_scale — that runs first and limits boundary layers.
+        # The proportional cap then catches any middle layer that nevertheless
+        # remains far above the global average.
+        #
+        # Example: global avg = 10%, margin = 2.0 → ceiling = 20%.
+        # A layer budgeted at 35% is capped to 20%; one at 15% is untouched.
+        if self.target_domain is not None and self.proportional_budget_margin > 0:
+            _layers_with_removals = [
+                lp for lp in prescriptions
+                if lp.domain_unnecessary_indices
+            ]
+            if _layers_with_removals:
+                _total_neurons = len(_layers_with_removals) * intermediate_size
+                _total_removed = sum(
+                    len(lp.domain_unnecessary_indices)
+                    for lp in _layers_with_removals
+                )
+                _global_avg_frac = (
+                    _total_removed / _total_neurons if _total_neurons > 0 else 0.0
+                )
+                _ceiling_frac = _global_avg_frac * self.proportional_budget_margin
+
+                n_capped = 0
+                for lp in _layers_with_removals:
+                    _current_n     = len(lp.domain_unnecessary_indices)
+                    _proportional_max = int(intermediate_size * _ceiling_frac)
+                    if _current_n > _proportional_max:
+                        _old_n = _current_n
+                        lp.domain_unnecessary_indices = (
+                            lp.domain_unnecessary_indices[:_proportional_max]
+                        )
+                        lp.domain_unnecessary_count = _proportional_max
+                        total_domain_unnecessary -= (_old_n - _proportional_max)
+                        n_capped += 1
+                        logger.info(
+                            "  Layer %d: proportional cap: %d → %d neurons "
+                            "(global_avg=%.1f%%, ceiling=%.1f%%)",
+                            lp.layer_idx, _old_n, _proportional_max,
+                            _global_avg_frac * 100, _ceiling_frac * 100,
+                        )
+
+                if n_capped > 0:
+                    logger.info(
+                        "  Proportional budget: %d layers capped "
+                        "(margin=%.1f×, global_avg=%.1f%%, ceiling=%.1f%%)",
+                        n_capped,
+                        self.proportional_budget_margin,
+                        _global_avg_frac * 100,
+                        _ceiling_frac * 100,
+                    )
 
         # Count totals for new operations
         total_low_rank = sum(1 for lp in prescriptions if lp.low_rank_target is not None)

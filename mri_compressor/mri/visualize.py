@@ -1289,6 +1289,8 @@ def plot_study24_domain_compression_curve(curve_result: dict, model_name: str, o
               for s in safe_sparsities]
     ax.barh(layer_indices, [s * 100 for s in safe_sparsities],
             color=colors, alpha=0.8, height=0.7)
+    ax.axvline(x=5.0, color="gray", linestyle="--", linewidth=1.5,
+               label="Previous 5% fixed cap")
     ax.set_xlabel("Safe Sparsity (%)")
     ax.set_ylabel("Layer")
     ax.set_title(

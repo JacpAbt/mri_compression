@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import gc
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -413,4 +413,258 @@ class DomainImprinter:
             applied = cls.apply(model, inspector, centroids, scale, device)
 
         print(f"  Domain imprinting complete: {len(applied)} layers updated.")
+        return applied
+
+    # ------------------------------------------------------------------
+    # Mode 3: per-class output-space centroids (class-conditional)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @torch.no_grad()
+    def compute_class_output_centroids(
+        model: nn.Module,
+        inspector,
+        class_dataloaders: Dict[str, object],
+        device,
+        max_batches: int = 16,
+    ) -> Dict[str, Dict[int, torch.Tensor]]:
+        """
+        Compute per-class, per-layer centroids in hidden (output) space.
+
+        For each class in *class_dataloaders* (e.g. ``{"yes": dl, "no": dl,
+        "maybe": dl, "general": dl}``), runs the model on that class's data
+        and hooks the down_proj OUTPUT to collect [hidden_size] centroids.
+
+        Call on the ORIGINAL model before compression to capture the clean,
+        undamaged per-class geometry.  Then call again on the compressed
+        model and pass both structures to ``apply_class_conditional_correction``
+        to inject weighted delta corrections.
+
+        Returns
+        -------
+        dict[class_name -> dict[layer_idx -> Tensor(hidden_size,)]] CPU/float32.
+        """
+        result: Dict[str, Dict[int, torch.Tensor]] = {}
+        for class_name, dl in class_dataloaders.items():
+            print(f"    Computing output centroids for class '{class_name}'...")
+            centroids = DomainImprinter.compute_output_centroids(
+                model, inspector, dl, device, max_batches=max_batches
+            )
+            result[class_name] = centroids
+        return result
+
+    @staticmethod
+    @torch.no_grad()
+    def apply_class_conditional_correction(
+        model: nn.Module,
+        inspector,
+        original_class_centroids: Dict[str, Dict[int, torch.Tensor]],
+        compressed_class_centroids: Dict[str, Dict[int, torch.Tensor]],
+        scale: float,
+        device,
+        class_weights: Optional[Dict[str, float]] = None,
+    ) -> Dict[int, dict]:
+        """
+        Inject class-conditional centroid corrections into down_proj bias.
+
+        For each class *c* and each layer *l*, computes:
+
+            delta_c_l = original_class_centroids[c][l] - compressed_class_centroids[c][l]
+
+        Then injects the class-importance–weighted mean delta:
+
+            bias_delta_l = scale * (Σ_c w_c · delta_c_l) / (Σ_c w_c)
+
+        This corrects *per-class geometry* — restoring the relative positions
+        of the yes/no/maybe regions in hidden space — rather than just shifting
+        the global domain mean.
+
+        Why per-class?
+        --------------
+        Global imprinting corrects the mean displacement of the whole domain
+        manifold but cannot restore class *separation*.  If the "maybe" region
+        collapsed toward "no" during compression (as seen empirically), the
+        global mean may barely shift while the per-class geometry is destroyed.
+        Class-conditional correction computes the shift of each class centroid
+        individually and restores it.
+
+        Default class weights
+        ---------------------
+        ``{"yes": 1.0, "no": 1.0, "maybe": 3.0, "general": 0.5}``
+
+        "maybe" is upweighted 3× because uncertainty circuits are the most
+        fragile (collapse to 0% accuracy at 15% compression).
+        "general" is downweighted (0.5×) so domain fluency geometry is
+        preserved without overwhelming the task-reasoning correction.
+        Missing classes default to 1.0.
+
+        Returns
+        -------
+        dict[layer_idx -> {"classes", "delta_norm", "n_classes", "class_deltas"}].
+        """
+        from .._utils import resolve_layer, get_mlp_modules
+
+        _default_weights: Dict[str, float] = {
+            "yes":     1.0,
+            "no":      1.0,
+            "maybe":   3.0,
+            "general": 0.5,
+        }
+        if class_weights is None:
+            class_weights = {}
+
+        # Determine the set of layers covered by every class
+        all_layer_sets: List[set] = [
+            set(c.keys())
+            for c in original_class_centroids.values()
+            if c
+        ]
+        if not all_layer_sets:
+            return {}
+        layer_indices = set.intersection(*all_layer_sets)
+
+        applied: Dict[int, dict] = {}
+
+        for layer_idx in sorted(layer_indices):
+            # Accumulate weighted delta across classes
+            weighted_delta: Optional[torch.Tensor] = None
+            total_weight = 0.0
+            classes_used: List[str] = []
+            class_delta_norms: Dict[str, float] = {}
+
+            for class_name, orig_centroids in original_class_centroids.items():
+                comp_centroids = compressed_class_centroids.get(class_name, {})
+                orig_c = orig_centroids.get(layer_idx)
+                comp_c = comp_centroids.get(layer_idx)
+
+                if orig_c is None or comp_c is None:
+                    continue
+                if orig_c.shape != comp_c.shape:
+                    logger.warning(
+                        "  Layer %d class '%s': shape mismatch %s vs %s — skipping",
+                        layer_idx, class_name, orig_c.shape, comp_c.shape,
+                    )
+                    continue
+
+                w = class_weights.get(
+                    class_name,
+                    _default_weights.get(class_name, 1.0),
+                )
+                delta_c = orig_c.float() - comp_c.float()   # [hidden_size]
+                class_delta_norms[class_name] = float(delta_c.norm().item())
+
+                if weighted_delta is None:
+                    weighted_delta = w * delta_c
+                else:
+                    weighted_delta = weighted_delta + w * delta_c
+                total_weight += w
+                classes_used.append(class_name)
+
+            if weighted_delta is None or total_weight == 0.0:
+                continue
+
+            mean_delta = weighted_delta / total_weight   # [hidden_size]
+
+            # Inject into down_proj bias
+            try:
+                layer    = resolve_layer(model, layer_idx, inspector)
+                mlp_mods = get_mlp_modules(layer)
+                down_proj = mlp_mods.get("down_proj")
+                if down_proj is None:
+                    continue
+            except Exception:
+                continue
+
+            weight_t  = down_proj.weight.data                       # [out, in]
+            delta_dev = mean_delta.to(device=weight_t.device, dtype=weight_t.dtype)
+
+            if delta_dev.shape[0] != weight_t.shape[0]:
+                logger.warning(
+                    "  Layer %d: delta size %d ≠ down_proj out_features %d — skipping",
+                    layer_idx, delta_dev.shape[0], weight_t.shape[0],
+                )
+                continue
+
+            if down_proj.bias is None:
+                down_proj.bias = nn.Parameter(
+                    torch.zeros(
+                        weight_t.shape[0],
+                        device=weight_t.device,
+                        dtype=weight_t.dtype,
+                    )
+                )
+
+            bias_delta = scale * delta_dev
+            down_proj.bias.data.add_(bias_delta)
+
+            applied[layer_idx] = {
+                "classes":      classes_used,
+                "delta_norm":   float(bias_delta.norm().item()),
+                "n_classes":    len(classes_used),
+                "class_deltas": class_delta_norms,
+            }
+            logger.debug(
+                "  Layer %d class-cond correction: %d classes, "
+                "delta_norm=%.4f, per_class=%s",
+                layer_idx, len(classes_used),
+                applied[layer_idx]["delta_norm"],
+                {k: f"{v:.4f}" for k, v in class_delta_norms.items()},
+            )
+
+        return applied
+
+    @classmethod
+    @torch.no_grad()
+    def imprint_class_conditional(
+        cls,
+        model: nn.Module,
+        inspector,
+        class_dataloaders: Dict[str, object],
+        original_class_centroids: Dict[str, Dict[int, torch.Tensor]],
+        device,
+        scale: float = 0.05,
+        max_batches: int = 16,
+        class_weights: Optional[Dict[str, float]] = None,
+    ) -> Dict[int, dict]:
+        """
+        Full class-conditional imprinting pass.
+
+        Computes per-class centroids on the (already compressed) model,
+        then injects the weighted mean delta to restore per-class geometry.
+
+        Parameters
+        ----------
+        class_dataloaders        : Dict[class_name -> DataLoader].
+                                   Same dataloaders used to capture
+                                   *original_class_centroids* before compression.
+        original_class_centroids : Pre-compression centroids from the original
+                                   model.  Produced by
+                                   ``compute_class_output_centroids()`` called
+                                   before ``compressor.compress()``.
+        class_weights            : Optional per-class importance weights.
+                                   Default: {"yes":1.0, "no":1.0, "maybe":3.0,
+                                   "general":0.5}.
+
+        Returns per-layer correction stats (delta_norm, n_classes, classes).
+        """
+        n_classes = len(class_dataloaders)
+        print(
+            f"\n  Class-conditional imprinting: {n_classes} classes "
+            f"({', '.join(class_dataloaders.keys())}), scale={scale:.3f}..."
+        )
+
+        # Compute per-class centroids on COMPRESSED model
+        print("  Computing class centroids on compressed model...")
+        compressed_class_centroids = cls.compute_class_output_centroids(
+            model, inspector, class_dataloaders, device, max_batches=max_batches
+        )
+
+        # Apply weighted mean class delta
+        applied = cls.apply_class_conditional_correction(
+            model, inspector,
+            original_class_centroids, compressed_class_centroids,
+            scale, device, class_weights=class_weights,
+        )
+
+        print(f"  Class-conditional imprinting complete: {len(applied)} layers updated.")
         return applied

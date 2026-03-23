@@ -26,7 +26,7 @@ import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -831,23 +831,142 @@ class MRICompressor:
         )
 
         # --- PPL after imprinting (domain) ---
-        post_ppl = self._evaluate_ppl_on(dl, max_batches=8)
-        recovered = pre_ppl - post_ppl
+        post_ppl   = self._evaluate_ppl_on(dl, max_batches=8)
+        ppl_delta  = post_ppl - pre_ppl          # positive = got worse, negative = improved
+        recovered  = pre_ppl  - post_ppl         # positive = PPL recovered (improved)
         recovered_pct = (recovered / pre_ppl * 100) if pre_ppl > 0 else 0.0
 
         print(f"  Domain PPL after  imprinting:  {post_ppl:.4f}")
-        if recovered > 0:
-            print(f"  PPL recovered:                 {recovered:.4f}  ({recovered_pct:+.1f}%)")
+        if ppl_delta < 0:
+            print(f"  PPL recovered:  {abs(ppl_delta):.4f}  ({-ppl_delta / pre_ppl * 100:+.2f}%)")
+        elif ppl_delta > 0:
+            print(f"  PPL change:     +{ppl_delta:.4f}  ({ppl_delta / pre_ppl * 100:+.2f}%)  "
+                  f"[imprinting had no benefit at this scale]")
         else:
-            print(f"  PPL change:                    {recovered:.4f}  ({recovered_pct:+.1f}%)")
+            print(f"  PPL change:     0.0000  (no effect)")
 
         return {
             "pre_imprint_domain_ppl":   pre_ppl,
             "post_imprint_domain_ppl":  post_ppl,
-            "ppl_recovered":            recovered,
+            "ppl_delta":                ppl_delta,       # post - pre: negative = improved
+            "ppl_recovered":            recovered,       # pre - post: positive = improved
             "ppl_recovered_pct":        recovered_pct,
             "per_layer":                per_layer,
             "used_original_centroids":  pre_computed_centroids is not None,
+        }
+
+    def apply_class_conditional_imprinting(
+        self,
+        original_class_centroids: Dict[str, Dict[int, torch.Tensor]],
+        class_dataloaders: Dict[str, object],
+        scale: Optional[float] = None,
+        max_batches: int = 16,
+        class_weights: Optional[Dict[str, float]] = None,
+    ) -> dict:
+        """
+        Post-compression class-conditional imprinting pass.
+
+        Restores per-class (yes / no / maybe / general) activation geometry by
+        computing how each class's hidden-space centroid shifted during
+        compression, then injecting the importance-weighted mean delta as a
+        per-layer down_proj bias correction.
+
+        Parameters
+        ----------
+        original_class_centroids : Per-class centroids from the ORIGINAL model
+            (before compression).  Produced by
+            ``DomainImprinter.compute_class_output_centroids()`` called on the
+            original model.
+            Structure: Dict[class_name -> Dict[layer_idx -> Tensor(hidden_size,)]].
+        class_dataloaders : DataLoaders per class, used here to compute
+            compressed-model class centroids.
+            Structure: Dict[class_name -> DataLoader].
+        scale : Injection scale (overrides self.imprinting_scale when set).
+        class_weights : Per-class importance weights.
+            Default: {"yes": 1.0, "no": 1.0, "maybe": 3.0, "general": 0.5}.
+            "maybe" is upweighted 3× because uncertainty circuits are the most
+            fragile under pruning.
+
+        Returns
+        -------
+        dict with keys:
+            "pre_imprint_domain_ppl"   – domain PPL before correction
+            "post_imprint_domain_ppl"  – domain PPL after correction
+            "ppl_delta"                – post - pre (negative = improved)
+            "ppl_recovered"            – pre - post (positive = improved)
+            "ppl_recovered_pct"        – recovery as % of pre-imprint PPL
+            "per_layer"                – per-layer correction stats
+            "n_classes_used"           – number of classes contributing
+            "class_names"              – list of class names used
+            "mode"                     – "class_conditional"
+        """
+        if not original_class_centroids or not class_dataloaders:
+            logger.warning(
+                "apply_class_conditional_imprinting: no centroids or dataloaders — skipping"
+            )
+            return {}
+        if self.inspector is None:
+            logger.warning(
+                "apply_class_conditional_imprinting: inspector required — skipping"
+            )
+            return {}
+
+        _scale   = scale if scale is not None else self.imprinting_scale
+        # Use any class dataloader for PPL measurement
+        _dl_ppl  = next(iter(class_dataloaders.values()), None) or self.domain_dataloader
+
+        # --- PPL before correction ---
+        pre_ppl = self._evaluate_ppl_on(_dl_ppl, max_batches=8) if _dl_ppl is not None else None
+        if pre_ppl is not None:
+            print(f"\n  Domain PPL before class-cond imprinting:  {pre_ppl:.4f}")
+
+        # --- Compute + inject class-conditional corrections ---
+        per_layer = DomainImprinter.imprint_class_conditional(
+            model=self.model,
+            inspector=self.inspector,
+            class_dataloaders=class_dataloaders,
+            original_class_centroids=original_class_centroids,
+            device=self.device,
+            scale=_scale,
+            max_batches=max_batches,
+            class_weights=class_weights,
+        )
+
+        # --- PPL after correction ---
+        post_ppl = self._evaluate_ppl_on(_dl_ppl, max_batches=8) if _dl_ppl is not None else None
+        if pre_ppl is not None and post_ppl is not None:
+            ppl_delta     = post_ppl - pre_ppl
+            recovered     = pre_ppl  - post_ppl
+            recovered_pct = (recovered / pre_ppl * 100) if pre_ppl > 0 else 0.0
+            print(f"  Domain PPL after  class-cond imprinting:  {post_ppl:.4f}")
+            if ppl_delta < 0:
+                print(
+                    f"  PPL recovered:  {abs(ppl_delta):.4f}  "
+                    f"({-ppl_delta / pre_ppl * 100:+.2f}%)"
+                )
+            elif ppl_delta > 0:
+                print(
+                    f"  PPL change:     +{ppl_delta:.4f}  "
+                    f"({ppl_delta / pre_ppl * 100:+.2f}%)  "
+                    f"[class-cond imprinting had no benefit at this scale]"
+                )
+            else:
+                print(f"  PPL change:     0.0000  (no effect)")
+        else:
+            ppl_delta     = None
+            recovered     = None
+            recovered_pct = None
+
+        return {
+            "pre_imprint_domain_ppl":   pre_ppl,
+            "post_imprint_domain_ppl":  post_ppl,
+            "ppl_delta":                ppl_delta,
+            "ppl_recovered":            recovered,
+            "ppl_recovered_pct":        recovered_pct,
+            "per_layer":                per_layer,
+            "n_classes_used":           len(original_class_centroids),
+            "class_names":              list(original_class_centroids.keys()),
+            "mode":                     "class_conditional",
         }
 
     @torch.no_grad()

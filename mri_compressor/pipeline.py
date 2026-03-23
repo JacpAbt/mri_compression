@@ -229,6 +229,8 @@ def run_imprinting_stage(
     config: ExperimentConfig,
     domain_dataloader=None,
     pre_computed_centroids=None,
+    pre_computed_class_centroids=None,
+    class_dataloaders=None,
 ) -> dict:
     """
     Stage 3.5 (optional): Domain Imprinting.
@@ -236,23 +238,37 @@ def run_imprinting_stage(
     Injects per-layer domain activation centroids into each down_proj bias.
     No retraining.  Partial recovery of domain PPL degradation from compression.
 
-    Parameters
-    ----------
-    pre_computed_centroids : Optional dict[layer_idx -> Tensor(hidden_size,)]
-        Output-space centroids computed from the *original* model before
-        compression (via DomainImprinter.compute_output_centroids).
-        When provided, the cleaner pre-compression domain signal is used
-        instead of recomputing centroids on the already-compressed model.
+    Two modes (auto-selected based on available inputs):
 
-    Returns the imprinting report dict (pre/post PPL, recovery %).
+    1. Class-conditional (preferred, biomedical domain):
+       When *pre_computed_class_centroids* and *class_dataloaders* are both
+       provided, computes per-class centroids on the compressed model and
+       injects the importance-weighted mean delta.  Each class (yes/no/maybe/
+       general) contributes proportionally to its weight — "maybe" at 3×
+       because it is the most fragile under pruning.
+
+    2. Global (fallback):
+       Uses *pre_computed_centroids* (output-space centroids from the original
+       model) or recomputes from the compressed model.  Corrects the global
+       domain manifold displacement but not per-class geometry.
+
+    Returns the imprinting report dict (pre/post PPL, recovery %, per-layer).
     """
     from .compression.compressor import MRICompressor
 
     print("\n" + "=" * 80)
     print("STAGE 3.5: DOMAIN IMPRINTING")
-    centroid_src = "original model" if pre_computed_centroids is not None else "compressed model"
-    print(f"  Scale: {config.imprinting_scale:.3f}  |  Domain: {config.target_domain}"
-          f"  |  Centroids from: {centroid_src}")
+    if pre_computed_class_centroids is not None and class_dataloaders is not None:
+        imprint_mode = "class-conditional"
+        centroid_src = f"original model ({len(pre_computed_class_centroids)} classes)"
+    elif pre_computed_centroids is not None:
+        imprint_mode = "global"
+        centroid_src = "original model (global)"
+    else:
+        imprint_mode = "global"
+        centroid_src = "compressed model (fresh)"
+    print(f"  Mode: {imprint_mode}  |  Scale: {config.imprinting_scale:.3f}"
+          f"  |  Domain: {config.target_domain}  |  Centroids from: {centroid_src}")
     print("=" * 80)
 
     if domain_dataloader is None:
@@ -263,11 +279,21 @@ def run_imprinting_stage(
             custom_name=config.custom_domain_name,
         )
 
-    if domain_dataloader is None:
-        print("  Warning: domain dataloader unavailable — imprinting skipped.")
-        return {}
+    # Class-conditional mode: domain_dataloader is not strictly required
+    # (class_dataloaders replaces it for PPL measurement).
+    # Fall back to loading a regular domain loader only for global mode.
+    if class_dataloaders is not None and pre_computed_class_centroids is not None:
+        # Class-conditional path: domain_dataloader may be None — use first class DL for PPL
+        _dl_for_ppl = next(iter(class_dataloaders.values()), None)
+        if _dl_for_ppl is None:
+            print("  Warning: class dataloaders empty — imprinting skipped.")
+            return {}
+    else:
+        if domain_dataloader is None:
+            print("  Warning: domain dataloader unavailable — imprinting skipped.")
+            return {}
 
-    # Build a minimal compressor wrapper just to call apply_domain_imprinting()
+    # Build a minimal compressor wrapper
     from .data_utils import load_wikitext_data, get_dataloader
     dataset = load_wikitext_data(
         inspector.tokenizer,
@@ -275,6 +301,11 @@ def run_imprinting_stage(
         num_samples=config.max_samples,
     )
     dataloader = get_dataloader(dataset, batch_size=config.batch_size)
+
+    # Use any available domain dataloader for the compressor's internal reference
+    _any_domain_dl = domain_dataloader or (
+        next(iter(class_dataloaders.values())) if class_dataloaders else None
+    )
 
     from .compression.prescription import CompressionPrescription
     dummy_prescription = CompressionPrescription(
@@ -291,17 +322,29 @@ def run_imprinting_stage(
         prescription=dummy_prescription,
         calibration_dataloader=dataloader,
         device=inspector.device,
-        domain_calibration_dataloader=domain_dataloader,
+        domain_calibration_dataloader=_any_domain_dl,
         inspector=inspector,
         enable_imprinting=True,
         imprinting_scale=config.imprinting_scale,
     )
 
-    report = compressor.apply_domain_imprinting(
-        domain_dataloader=domain_dataloader,
-        scale=config.imprinting_scale,
-        pre_computed_centroids=pre_computed_centroids,
-    )
+    # Choose imprinting mode
+    if class_dataloaders is not None and pre_computed_class_centroids is not None:
+        # Preferred: class-conditional geometry restoration
+        report = compressor.apply_class_conditional_imprinting(
+            original_class_centroids=pre_computed_class_centroids,
+            class_dataloaders=class_dataloaders,
+            scale=config.imprinting_scale,
+        )
+    else:
+        # Fallback: global domain centroid imprinting
+        report = compressor.apply_domain_imprinting(
+            domain_dataloader=domain_dataloader,
+            scale=config.imprinting_scale,
+            pre_computed_centroids=pre_computed_centroids,
+        )
+        report["mode"] = "global"
+
     return report
 
 
@@ -353,8 +396,12 @@ def run_compression_stage(
     # ------------------------------------------------------------------ #
     #  Capture original-model centroids BEFORE compression destroys them  #
     # ------------------------------------------------------------------ #
-    original_centroids = None
+    original_centroids       = None
+    original_class_centroids = None
+    class_dataloaders        = None
+
     if config.enable_imprinting and domain_dataloader is not None:
+        # Global output-space centroids (dimension-stable, works for any domain)
         print("\n  Pre-computing domain centroids from original model (output space)...")
         original_centroids = DomainImprinter.compute_output_centroids(
             model=inspector.model,
@@ -363,7 +410,45 @@ def run_compression_stage(
             device=inspector.device,
             max_batches=16,
         )
-        print(f"  Original centroids captured for {len(original_centroids)} layers.")
+        print(f"  Global centroids captured for {len(original_centroids)} layers.")
+
+        # Class-conditional centroids (biomedical: yes/no/maybe/general)
+        # These allow the imprinting step to restore per-class geometry, not
+        # just the global domain mean — particularly important for protecting
+        # the fragile "maybe" uncertainty circuit.
+        if config.target_domain == "biomedical":
+            try:
+                from .mri.studies_domain_compression import load_class_biomedical_datasets
+                print("\n  Pre-computing per-class domain centroids from original model...")
+                class_datasets = load_class_biomedical_datasets(
+                    inspector.tokenizer,
+                    max_seq_len=config.max_length,
+                    n_samples=32,
+                )
+                if class_datasets:
+                    class_dataloaders = {
+                        cls_name: get_dataloader(ds, batch_size=config.batch_size)
+                        for cls_name, ds in class_datasets.items()
+                    }
+                    original_class_centroids = DomainImprinter.compute_class_output_centroids(
+                        model=inspector.model,
+                        inspector=inspector,
+                        class_dataloaders=class_dataloaders,
+                        device=inspector.device,
+                        max_batches=16,
+                    )
+                    print(
+                        f"  Per-class centroids captured: "
+                        f"{list(original_class_centroids.keys())}"
+                    )
+                else:
+                    print("  Warning: per-class dataset loading returned empty — "
+                          "falling back to global imprinting.")
+            except Exception as exc:
+                print(
+                    f"  Warning: per-class centroid computation failed ({exc}) — "
+                    f"falling back to global imprinting."
+                )
 
     compressor = MRICompressor(
         model=inspector.model,
@@ -383,7 +468,7 @@ def run_compression_stage(
     )
 
     result = compressor.compress()
-    return result, original_centroids
+    return result, original_centroids, original_class_centroids, class_dataloaders
 
 
 def _create_domain_dataloader(
@@ -688,10 +773,11 @@ def run_pipeline(args):
                 )
 
         # Stage 3: Compression
-        # Returns (result, original_centroids); centroids are captured from the
-        # original model before it is modified, then passed to imprinting.
-        result, original_centroids = run_compression_stage(
-            inspector, prescription, config, summary
+        # Returns (result, original_centroids, original_class_centroids, class_dataloaders).
+        # The last two are populated for biomedical domain + imprinting enabled;
+        # they are None otherwise (graceful fallback to global imprinting).
+        result, original_centroids, original_class_centroids, class_dataloaders = (
+            run_compression_stage(inspector, prescription, config, summary)
         )
 
         # Stage 3.5: Domain Imprinting (optional, requires --imprint and --domain)
@@ -700,6 +786,8 @@ def run_pipeline(args):
             imprint_report = run_imprinting_stage(
                 inspector, config,
                 pre_computed_centroids=original_centroids,
+                pre_computed_class_centroids=original_class_centroids,
+                class_dataloaders=class_dataloaders,
             )
             # Persist imprinting report alongside the evaluation report
             imprint_path = os.path.join(config.output_dir, "imprinting_report.json")

@@ -258,6 +258,31 @@ class MRIRunner:
         elif study_num == 22:
             from .studies_domain_importance import run_domain_conditional_importance
             custom = self._load_custom_domain() if self._has_custom_domain() else None
+
+            # Task-aware calibration: replace plain domain text with QA-formatted
+            # prompts for registered domains.  Plain text Wanda scoring misses
+            # reasoning neurons (they barely fire on bare abstracts) — especially
+            # the uncertainty circuit that produces "maybe" answers, which collapses
+            # to 0% accuracy after compression when plain-text scoring is used.
+            #
+            # QA prompts force the model through the decision step during forward
+            # passes, so neurons that fire when committing to yes/no/maybe get high
+            # Wanda scores and are protected from removal.
+            domain_name = getattr(self.config, "custom_domain_name", None) or "biomedical"
+            if domain_name == "biomedical" and not (
+                custom and "biomedical" in custom
+            ):
+                from .studies_domain_compression import load_biomedical_qa_dataset
+                print(f"\n  [Study 22] Task-aware QA calibration for '{domain_name}'")
+                qa_dataset = load_biomedical_qa_dataset(
+                    self.inspector.tokenizer,
+                    max_seq_len=self.config.max_length,
+                    n_samples=min(64, self.config.max_samples),
+                )
+                # Merge QA dataset into custom dict (keeps any other domains intact)
+                custom = dict(custom or {})
+                custom[domain_name] = qa_dataset
+
             self.results["domain_conditional_importance"] = run_domain_conditional_importance(
                 self.inspector,
                 batch_size=self.config.batch_size,
